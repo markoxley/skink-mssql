@@ -1,0 +1,747 @@
+// File:    ms_type.skink
+// Purpose: TDS type system — column type-info decoding from
+//          COLMETADATA, row value decoding per column type, and
+//          parameter encoding for RPC (sp_executesql) calls.
+//
+//          Coverage: the fixed-length scalars, the nullable (N)
+//          variants, the variable string/binary families, GUID,
+//          decimal/numeric (rendered as text), the date/time family,
+//          money. PLP types (VARCHAR(MAX) 0xFFFF len) are supported on
+//          read; TEXT/NTEXT/IMAGE legacy blobs are supported on read.
+module ms_type
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "ms_pkt"
+
+// TDS type codes (subset — see file header).
+pub const T_NULL         = 0x1F
+pub const T_GUID         = 0x24
+pub const T_INTN         = 0x26
+pub const T_VARCHAR      = 0x27
+pub const T_DATE         = 0x28
+pub const T_TIME         = 0x29
+pub const T_DATETIME2    = 0x2A
+pub const T_DATETIMEOFF  = 0x2B
+pub const T_INT1         = 0x30
+pub const T_BIT          = 0x32
+pub const T_INT2         = 0x34
+pub const T_INT4         = 0x38
+pub const T_DATETIME4    = 0x3A
+pub const T_FLT4         = 0x3B
+pub const T_MONEY4       = 0x7A // note: officially 0x7A
+pub const T_DATETIME     = 0x3D
+pub const T_FLT8         = 0x3E
+pub const T_MONEY        = 0x3C
+pub const T_DECIMALN     = 0x6A
+pub const T_NUMERICN     = 0x6C
+pub const T_FLTN         = 0x6D
+pub const T_MONEYN       = 0x6E
+pub const T_DATETIMN     = 0x6F
+pub const T_BITN         = 0x68
+pub const T_INT8         = 0x7F
+pub const T_BIGVARBINARY = 0xA5
+pub const T_BIGVARCHAR   = 0xA7
+pub const T_BIGBINARY    = 0xAD
+pub const T_BIGCHAR      = 0xAF
+pub const T_NTEXT        = 0x63
+pub const T_TEXT         = 0x23
+pub const T_IMAGE        = 0x22
+pub const T_NVARCHAR     = 0xE7
+pub const T_NCHAR        = 0xEF
+pub const T_XML          = 0xF1
+pub const T_SQLVARIANT   = 0x62
+
+// ColMeta is one decoded column description from COLMETADATA.
+pub struct ColMeta {
+    Name:      string
+    Type:      int
+    MaxLen:    int
+    Precision: int
+    Scale:     int
+    Flags:     int
+    Nullable:  bool
+}
+
+// ---- type-info parsing ----------------------------------------------------
+
+// isFixedLen reports whether the type carries no length byte in rows.
+fn isFixedLen(t: int) -> bool {
+    return t == T_BIT || t == T_INT1 || t == T_INT2 || t == T_INT4 ||
+        t == T_INT8 || t == T_FLT4 || t == T_FLT8 ||
+        t == T_DATETIME4 || t == T_DATETIME ||
+        t == T_MONEY4 || t == T_MONEY
+}
+
+// ParseTypeInfo reads the type-dependent bytes of one COLMETADATA
+// column entry, after usertype+flags were consumed. Layout per spec:
+//   nullable scalars (INTN/BITN/FLTN/MONEYN/DATETIMN) → u8 maxlen
+//   DECIMALN/NUMERICN → u8 maxlen + u8 precision + u8 scale
+//   TIME/DATETIME2/DATETIMEOFFSET → u8 scale
+//   legacy VARCHAR/CHAR/VARBINARY/BINARY → u16 maxlen (no collation)
+//   BIGCHAR/BIGVARCHAR/NCHAR/NVARCHAR → u16 maxlen + 5B collation
+//   BIGBINARY/BIGVARBINARY → u16 maxlen
+//   TEXT/NTEXT → u32 maxlen + 5B collation + u16 parts + parts
+//   IMAGE → u32 maxlen + u16 parts + parts
+//   XML → u8 schema-present flag + optional schema triple
+//   SQLVARIANT → u32 maxlen
+//   GUID/DATE/fixed scalars → nothing
+pub fn ParseTypeInfo(r: *ms_pkt.Reader, m: *ColMeta) -> errors.Error {
+    t := m.Type
+    if isFixedLen(t) || t == T_GUID || t == T_DATE {
+        return errors.New("")
+    }
+    if t == T_DECIMALN || t == T_NUMERICN {
+        m.MaxLen = ms_pkt.RByte(r)
+        m.Precision = ms_pkt.RByte(r)
+        m.Scale = ms_pkt.RByte(r)
+        return errors.New("")
+    }
+    if t == T_INTN || t == T_BITN || t == T_FLTN || t == T_MONEYN ||
+        t == T_DATETIMN {
+        m.MaxLen = ms_pkt.RByte(r)
+        return errors.New("")
+    }
+    if t == T_TIME || t == T_DATETIME2 || t == T_DATETIMEOFF {
+        m.Scale = ms_pkt.RByte(r)
+        return errors.New("")
+    }
+    if t == T_VARCHAR || t == 0x2F || t == 0x25 || t == 0x2D {
+        m.MaxLen = ms_pkt.RI16(r)
+        return errors.New("")
+    }
+    if t == T_BIGVARCHAR || t == T_BIGCHAR || t == T_NVARCHAR ||
+        t == T_NCHAR {
+        m.MaxLen = ms_pkt.RI16(r)
+        ms_pkt.RBytes(r, 5) // collation
+        return errors.New("")
+    }
+    if t == T_BIGVARBINARY || t == T_BIGBINARY {
+        m.MaxLen = ms_pkt.RI16(r)
+        return errors.New("")
+    }
+    if t == T_TEXT || t == T_NTEXT {
+        m.MaxLen = int(ms_pkt.RI32(r))
+        ms_pkt.RBytes(r, 5)
+        parts := ms_pkt.RI16(r)
+        for i := 0; i < parts; i = i + 1 {
+            nl := ms_pkt.RI16(r)
+            ms_pkt.RBytes(r, nl * 2)
+        }
+        return errors.New("")
+    }
+    if t == T_IMAGE {
+        m.MaxLen = int(ms_pkt.RI32(r))
+        parts := ms_pkt.RI16(r)
+        for i := 0; i < parts; i = i + 1 {
+            nl := ms_pkt.RI16(r)
+            ms_pkt.RBytes(r, nl * 2)
+        }
+        return errors.New("")
+    }
+    if t == T_XML {
+        present := ms_pkt.RByte(r)
+        if present == 1 {
+            ms_pkt.RBytes(r, ms_pkt.RByte(r))      // dbname
+            ms_pkt.RBytes(r, ms_pkt.RByte(r))      // owner
+            ns := ms_pkt.RI16(r)
+            if ns != 65535 {
+                ms_pkt.RBytes(r, ns)             // schema collection
+            }
+        }
+        return errors.New("")
+    }
+    if t == T_SQLVARIANT {
+        m.MaxLen = int(ms_pkt.RI32(r))
+        return errors.New("")
+    }
+    return errors.New("")
+}
+
+// IsTextual reports a char/text type (rows decode to UTF-8 text).
+pub fn IsTextual(t: int) -> bool {
+    return t == T_VARCHAR || t == T_BIGVARCHAR || t == T_BIGCHAR ||
+        t == T_NVARCHAR || t == T_NCHAR || t == T_TEXT || t == T_NTEXT ||
+        t == T_XML
+}
+
+// IsBinary reports binary-family types.
+pub fn IsBinary(t: int) -> bool {
+    return t == T_BIGVARBINARY || t == T_BIGBINARY || t == T_IMAGE ||
+        t == 0x25 || t == 0x2D || t == T_GUID
+}
+
+// ---- value decoding --------------------------------------------------------
+
+// decodeFixed reads a fixed-width scalar of type t.
+fn decodeFixed(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
+    if t == T_BIT {
+        return dbx_value.Bool(ms_pkt.RByte(r) != 0)
+    }
+    if t == T_INT1 {
+        return dbx_value.Int(int64(ms_pkt.RByte(r)))
+    }
+    if t == T_INT2 {
+        v := ms_pkt.RI16(r)
+        if v >= 32768 {
+            return dbx_value.Int(int64(v - 65536))
+        }
+        return dbx_value.Int(int64(v))
+    }
+    if t == T_INT4 {
+        v := ms_pkt.RI32(r)
+        if v >= int64(2147483648) {
+            v = v - int64(4294967296)
+        }
+        return dbx_value.Int(v)
+    }
+    if t == T_INT8 {
+        return dbx_value.Int(ms_pkt.RI64(r))
+    }
+    if t == T_FLT4 {
+        return dbx_value.Float(f32ToF64(ms_pkt.RI32(r)))
+    }
+    if t == T_FLT8 {
+        bits := ms_pkt.RI64(r)
+        var f float
+        bf := libc.malloc(8)
+        for i := 0; i < 8; i = i + 1 {
+            bf[i] = int((bits >> (i * 8)) & int64(255))
+        }
+        libc.memcpy(&f, bf, 8)
+        libc.free(bf)
+        return dbx_value.Float(f)
+    }
+    if t == T_DATETIME4 {
+        days := ms_pkt.RI16(r)
+        mins := ms_pkt.RI16(r)
+        us := (int64(days) - int64(719163)) * int64(86400000000) +
+            int64(mins) * int64(60000000)
+        return dbx_value.TimeUnixMicros(us)
+    }
+    if t == T_DATETIME {
+        days := ms_pkt.RI32(r)
+        ticks := ms_pkt.RI32(r)
+        us := (days - int64(719163)) * int64(86400000000) +
+            ticks * int64(1000000) / int64(300)
+        return dbx_value.TimeUnixMicros(us)
+    }
+    if t == T_MONEY4 {
+        v := ms_pkt.RI32(r)
+        if v >= int64(2147483648) {
+            v = v - int64(4294967296)
+        }
+        return dbx_value.Float(float(v) / 10000.0)
+    }
+    if t == T_MONEY {
+        hi := ms_pkt.RI32(r)
+        lo := ms_pkt.RI32(r)
+        v := (hi << 32) | (lo & int64(4294967295))
+        return dbx_value.Float(float(v) / 10000.0)
+    }
+    return dbx_value.Null()
+}
+
+// decodeDecimal turns the DECIMALN/NUMERICN payload (sign byte +
+// little-endian magnitude) into a text literal.
+fn decodeDecimal(r: *ms_pkt.Reader, n: int, scale: int) -> dbx_value.Value {
+    sign := ms_pkt.RByte(r)
+    digits := ms_pkt.RBytes(r, n - 1)
+    // Big-endian decimal via repeated divmod-10 on the LE byte array.
+    // Work on a mutable copy.
+    sz := n - 1
+    buf := libc.malloc(sz)
+    libc.memcpy(buf, digits, sz)
+    out := libc.malloc(sz * 3 + 4)
+    outLen := 0
+    // Repeatedly divide the big integer by 10, collecting remainders.
+    for {
+        zero := true
+        carry := 0
+        for i := sz - 1; i >= 0; i = i - 1 {
+            cur := (carry << 8) | (int(buf[i]) & 255)
+            buf[i] = cur / 10
+            carry = cur % 10
+            if buf[i] != 0 {
+                zero = false
+            }
+        }
+        out[outLen] = 48 + carry
+        outLen = outLen + 1
+        if zero {
+            break
+        }
+    }
+    // Reverse into most-significant-first digits.
+    res := libc.malloc(outLen + scale + 4)
+    j := 0
+    if sign == 0 {
+        res[j] = 45 // '-'
+        j = j + 1
+    }
+    if outLen > scale {
+        for i := 0; i < outLen - scale; i = i + 1 {
+            res[j] = out[outLen - 1 - i]
+            j = j + 1
+        }
+        res[j] = 46
+        j = j + 1
+        for i := 0; i < scale; i = i + 1 {
+            res[j] = out[scale - 1 - i]
+            j = j + 1
+        }
+    } else {
+        res[j] = 48
+        res[j + 1] = 46
+        j = j + 2
+        for i := 0; i < scale - outLen; i = i + 1 {
+            res[j] = 48
+            j = j + 1
+        }
+        for i := outLen - 1; i >= 0; i = i - 1 {
+            res[j] = out[i]
+            j = j + 1
+        }
+    }
+    res[j] = 0
+    libc.free(digits)
+    libc.free(buf)
+    libc.free(out)
+    return dbx_value.TextN(res, j)
+}
+
+// decodeLenPrefixed reads a nullable (u8-length) fixed-family value.
+fn decodeLenPrefixed(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
+    n := ms_pkt.RByte(r)
+    if n == 0 {
+        return dbx_value.Null()
+    }
+    // For INTN the underlying width comes from n; for FLTN, n=4→float4.
+    if t == T_INTN {
+        if n == 1 { return dbx_value.Int(int64(ms_pkt.RByte(r))) }
+        if n == 2 {
+            v := ms_pkt.RI16(r)
+            if v >= 32768 { v = v - 65536 }
+            return dbx_value.Int(int64(v))
+        }
+        if n == 4 {
+            v := ms_pkt.RI32(r)
+            if v >= int64(2147483648) { v = v - int64(4294967296) }
+            return dbx_value.Int(v)
+        }
+        return dbx_value.Int(ms_pkt.RI64(r))
+    }
+    if t == T_BITN {
+        return dbx_value.Bool(ms_pkt.RByte(r) != 0)
+    }
+    if t == T_FLTN {
+        if n == 4 {
+            bits := ms_pkt.RI32(r)
+            var f float
+            fv := f32ToF64(bits)
+            f = fv
+            return dbx_value.Float(f)
+        }
+        bits := ms_pkt.RI64(r)
+        var f float
+        bf := libc.malloc(8)
+        for i := 0; i < 8; i = i + 1 {
+            bf[i] = int((bits >> (i * 8)) & int64(255))
+        }
+        libc.memcpy(&f, bf, 8)
+        libc.free(bf)
+        return dbx_value.Float(f)
+    }
+    if t == T_MONEYN {
+        if n == 4 {
+            v := ms_pkt.RI32(r)
+            if v >= int64(2147483648) { v = v - int64(4294967296) }
+            return dbx_value.Float(float(v) / 10000.0)
+        }
+        hi := ms_pkt.RI32(r)
+        lo := ms_pkt.RI32(r)
+        return dbx_value.Float(float((hi << 32) | (lo & int64(4294967295))) / 10000.0)
+    }
+    if t == T_DATETIMN {
+        if n == 4 {
+            days := ms_pkt.RI16(r)
+            mins := ms_pkt.RI16(r)
+            us := (int64(days) - int64(719163)) * int64(86400000000) +
+                int64(mins) * int64(60000000)
+            return dbx_value.TimeUnixMicros(us)
+        }
+        days := ms_pkt.RI32(r)
+        ticks := ms_pkt.RI32(r)
+        us := (days - int64(719163)) * int64(86400000000) +
+            ticks * int64(1000000) / int64(300)
+        return dbx_value.TimeUnixMicros(us)
+    }
+    if t == T_DECIMALN || t == T_NUMERICN {
+        return dbx_value.Null() // handled by caller with scale
+    }
+    return dbx_value.Null()
+}
+
+// f32ToF64 converts IEEE-754 single bits to double.
+fn f32ToF64(bits: int64) -> float {
+    sign := 1.0
+    if (bits & int64(2147483648)) != 0 {
+        sign = -1.0
+        bits = bits - int64(2147483648)
+    }
+    exp := (bits >> 23) & int64(255)
+    mant := bits & int64(8388607)
+    if exp == int64(255) {
+        return sign * 1e308 * 10.0 // inf (nan coerces to huge too)
+    }
+    if exp == int64(0) {
+        if mant == int64(0) {
+            return 0.0 * sign
+        }
+        fv := float(mant) / 8388608.0
+        for i := 0; i < 126; i = i + 1 {
+            fv = fv / 2.0
+        }
+        return fv * sign
+    }
+    fv := (float(mant) + 8388608.0) / 8388608.0
+    e := int(exp) - 127
+    if e >= 0 {
+        for i := 0; i < e; i = i + 1 {
+            fv = fv * 2.0
+        }
+    } else {
+        for i := 0; i < -e; i = i + 1 {
+            fv = fv / 2.0
+        }
+    }
+    return fv * sign
+}
+
+// DecodeValue reads one row cell per column metadata.
+pub fn DecodeValue(r: *ms_pkt.Reader, m: ColMeta) -> dbx_value.Value {
+    t := m.Type
+    if isFixedLen(t) {
+        return decodeFixed(r, t)
+    }
+    if t == T_INTN || t == T_BITN || t == T_FLTN || t == T_MONEYN ||
+        t == T_DATETIMN {
+        return decodeLenPrefixed(r, t)
+    }
+    if t == T_DECIMALN || t == T_NUMERICN {
+        n := ms_pkt.RByte(r)
+        if n == 0 {
+            return dbx_value.Null()
+        }
+        return decodeDecimal(r, n, m.Scale)
+    }
+    if t == T_GUID {
+        n := ms_pkt.RByte(r)
+        if n == 0 {
+            return dbx_value.Null()
+        }
+        b := ms_pkt.RBytes(r, 16)
+        return dbx_value.Blob(b, 16)
+    }
+    // Var-len char/binary: u16 len, 0xFFFF = NULL.
+    if t == T_BIGVARCHAR || t == T_BIGCHAR || t == T_VARCHAR ||
+        t == T_BIGVARBINARY || t == T_BIGBINARY ||
+        t == 0x25 || t == 0x2D {
+        if m.MaxLen == 65535 { // PLP (MAX) — chunked stream
+            return decodePLP(r, t)
+        }
+        n := ms_pkt.RI16(r)
+        if n == 65535 {
+            return dbx_value.Null()
+        }
+        s := ms_pkt.RBytes(r, n)
+        if t == T_BIGVARBINARY || t == T_BIGBINARY || t == 0x25 || t == 0x2D {
+            return dbx_value.Blob(s, n)
+        }
+        return dbx_value.TextN(s, n)
+    }
+    if t == T_NVARCHAR || t == T_NCHAR {
+        if m.MaxLen == 65535 {
+            return decodePLP(r, t)
+        }
+        n := ms_pkt.RI16(r)
+        if n == 65535 {
+            return dbx_value.Null()
+        }
+        s := ms_pkt.RUcs2(r, n)
+        return dbx_value.TextN(s, str.Len(s))
+    }
+    if t == T_TEXT || t == T_NTEXT || t == T_IMAGE {
+        return decodeLegacyBlob(r, t)
+    }
+    if t == T_DATE {
+        // u8 len (3) + 3-byte LE days since 0001-01-01.
+        n := ms_pkt.RByte(r)
+        if n == 0 {
+            return dbx_value.Null()
+        }
+        days := int64(ms_pkt.RByte(r)) | (int64(ms_pkt.RByte(r)) << 8) |
+            (int64(ms_pkt.RByte(r)) << 16)
+        // days since 0001-01-01; Unix epoch is day 719162
+        return dbx_value.TimeUnixMicros((days - int64(719162)) * int64(86400000000))
+    }
+    if t == T_TIME || t == T_DATETIME2 || t == T_DATETIMEOFF {
+        return decodeDatetime2(r, t, m.Scale)
+    }
+    if t == T_XML {
+        // PLP stream.
+        return decodePLP(r, t)
+    }
+    if t == T_SQLVARIANT {
+        // Variant: u32 total len + base type + propbytes + value.
+        n := ms_pkt.RI32(r)
+        if n == int64(0) {
+            return dbx_value.Null()
+        }
+        s := ms_pkt.RBytes(r, int(n))
+        return dbx_value.Blob(s, int(n))
+    }
+    return dbx_value.Null()
+}
+
+// decodePLP reads a Partially Length-Prefixed stream: u64 total
+// (0xFFFFFFFFFFFFFFFF = unknown), then u32-length chunks until 0.
+fn decodePLP(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
+    total := ms_pkt.RI64(r)
+    if total == int64(-1) {
+        return dbx_value.Null()
+    }
+    var out string
+    outLen := 0
+    for {
+        n := ms_pkt.RI32(r)
+        if n == int64(0) {
+            break
+        }
+        chunk := ms_pkt.RBytes(r, int(n))
+        nb := libc.malloc(outLen + int(n) + 1)
+        if outLen > 0 {
+            libc.memcpy(nb, out, outLen)
+            libc.free(out)
+        }
+        libc.memcpy(string(int64(nb) + int64(outLen)), chunk, int(n))
+        nb[outLen + int(n)] = 0
+        out = nb
+        outLen = outLen + int(n)
+        libc.free(chunk)
+    }
+    if t == T_NVARCHAR || t == T_NCHAR || t == T_XML {
+        // UTF-16LE → UTF-8.
+        rr := ms_pkt.NewReader(out, outLen)
+        s := ms_pkt.RUcs2(&rr, outLen)
+        v := dbx_value.TextN(s, str.Len(s))
+        libc.free(out)
+        return v
+    }
+    if t == T_BIGVARBINARY || t == T_BIGBINARY {
+        return dbx_value.Blob(out, outLen)
+    }
+    v := dbx_value.TextN(out, outLen)
+    return v
+}
+
+// decodeLegacyBlob reads TEXT/NTEXT/IMAGE cells: u8 textptr len,
+// textptr, 8-byte timestamp, u32 data len, data.
+fn decodeLegacyBlob(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
+    ptrLen := ms_pkt.RByte(r)
+    if ptrLen == 0 {
+        return dbx_value.Null()
+    }
+    ms_pkt.RBytes(r, ptrLen)
+    ms_pkt.RBytes(r, 8)
+    n := ms_pkt.RI32(r)
+    data := ms_pkt.RBytes(r, int(n))
+    if t == T_IMAGE {
+        return dbx_value.Blob(data, int(n))
+    }
+    if t == T_NTEXT {
+        rr := ms_pkt.NewReader(data, int(n))
+        s := ms_pkt.RUcs2(&rr, int(n))
+        return dbx_value.TextN(s, str.Len(s))
+    }
+    return dbx_value.TextN(data, int(n))
+}
+
+// decodeDatetime2 handles TIME (n), DATETIME2 (n+date), DATETIMEOFFSET
+// (n+date+i16offset). Time byte width derives from scale.
+fn decodeDatetime2(r: *ms_pkt.Reader, t: int, scale: int) -> dbx_value.Value {
+    n := ms_pkt.RByte(r)
+    if n == 0 {
+        return dbx_value.Null()
+    }
+    timeLen := 3
+    if scale > 4 {
+        timeLen = 5
+    } else if scale > 2 {
+        timeLen = 4
+    }
+    ticks := int64(0)
+    for i := 0; i < timeLen; i = i + 1 {
+        ticks = ticks | (int64(ms_pkt.RByte(r)) << (i * 8))
+    }
+    // ticks are in 10^-scale second units; convert to µs (10^-6).
+    micros := ticks
+    for i := scale; i < 6; i = i + 1 {
+        micros = micros * 10
+    }
+    for i := scale; i > 6; i = i - 1 {
+        micros = micros / 10
+    }
+    if t == T_TIME {
+        return dbx_value.Text(timeToText(micros))
+    }
+    // 3-byte date (days since 0001-01-01).
+    days := int64(ms_pkt.RByte(r)) | (int64(ms_pkt.RByte(r)) << 8) |
+        (int64(ms_pkt.RByte(r)) << 16)
+    us := (days - int64(719162)) * int64(86400000000) + micros
+    if t == T_DATETIMEOFF {
+        off := ms_pkt.RI16(r)
+        if off >= 32768 {
+            off = off - 65536
+        }
+        us = us - int64(off) * int64(60000000)
+    }
+    return dbx_value.TimeUnixMicros(us)
+}
+
+// timeToText renders micros-since-midnight as HH:MM:SS.ffffff.
+fn timeToText(us: int64) -> string {
+    secs := us / int64(1000000)
+    frac := us % int64(1000000)
+    hh := secs / 3600
+    mi := (secs % 3600) / 60
+    ss := secs % 60
+    hm := str.Concat(pad2(int(hh)), str.Concat(":", pad2(int(mi))))
+    sf := str.Concat(pad2(int(ss)), str.Concat(".", pad6(int(frac))))
+    return str.Concat(hm, str.Concat(":", sf))
+}
+
+fn pad2(v: int) -> string {
+    if v < 10 {
+        return str.Concat("0", strconv.Itoa64(int64(v)))
+    }
+    return strconv.Itoa64(int64(v))
+}
+
+fn pad6(v: int) -> string {
+    s := strconv.Itoa64(int64(v))
+    for str.Len(s) < 6 {
+        s = str.Concat("0", s)
+    }
+    return s
+}
+
+// ---- parameter encoding for RPC -----------------------------------------
+
+// EncodeParamType appends the TDS type-info for a bound param.
+pub fn EncodeParamType(b: *ms_pkt.OutBuf, v: dbx_value.Value) {
+    if dbx_value.IsNull(v) {
+        ms_pkt.Byte(b, T_INTN)
+        ms_pkt.Byte(b, 8)
+        return
+    }
+    if v.Kind == dbx_value.KIND_INT {
+        ms_pkt.Byte(b, T_INTN)
+        ms_pkt.Byte(b, 8)
+        return
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        ms_pkt.Byte(b, T_BITN)
+        ms_pkt.Byte(b, 1)
+        return
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        ms_pkt.Byte(b, T_FLTN)
+        ms_pkt.Byte(b, 8)
+        return
+    }
+    if v.Kind == dbx_value.KIND_BLOB {
+        ms_pkt.Byte(b, T_BIGVARBINARY)
+        ms_pkt.I16(b, 8000)
+        return
+    }
+    if v.Kind == dbx_value.KIND_TIME {
+        ms_pkt.Byte(b, T_DATETIME2)
+        ms_pkt.Byte(b, 7) // scale
+        return
+    }
+    // Text → NVARCHAR.
+    ms_pkt.Byte(b, T_NVARCHAR)
+    ms_pkt.I16(b, 4000)
+    // collation: 5 bytes — use the common SQL_Latin1-ish default.
+    ms_pkt.Byte(b, 0x09)
+    ms_pkt.Byte(b, 0x04)
+    ms_pkt.Byte(b, 0xD0)
+    ms_pkt.Byte(b, 0)
+    ms_pkt.Byte(b, 0)
+}
+
+// EncodeParamValue appends the wire value for a bound param.
+pub fn EncodeParamValue(b: *ms_pkt.OutBuf, v: dbx_value.Value) {
+    if dbx_value.IsNull(v) {
+        ms_pkt.Byte(b, 0) // INTN len 0 = NULL
+        return
+    }
+    if v.Kind == dbx_value.KIND_INT {
+        ms_pkt.Byte(b, 8)
+        ms_pkt.I64(b, v.I64)
+        return
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        ms_pkt.Byte(b, 1)
+        if v.Bool {
+            ms_pkt.Byte(b, 1)
+        } else {
+            ms_pkt.Byte(b, 0)
+        }
+        return
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        ms_pkt.Byte(b, 8)
+        var f float
+        f = v.F64
+        fp := libc.malloc(8)
+        libc.memcpy(fp, &f, 8)
+        ms_pkt.WriteN(b, fp, 8)
+        libc.free(fp)
+        return
+    }
+    if v.Kind == dbx_value.KIND_BLOB {
+        ms_pkt.I16(b, v.Len)
+        ms_pkt.WriteN(b, dbx_value.Bytes(v), v.Len)
+        return
+    }
+    if v.Kind == dbx_value.KIND_TIME {
+        // DATETIME2: u8 len(8), 5-byte time ticks (10^-7 s), 3-byte date.
+        us := v.I64
+        days := us / int64(86400000000)
+        rem := us % int64(86400000000)
+        if rem < 0 {
+            rem = rem + int64(86400000000)
+            days = days - 1
+        }
+        ticks := rem * 10 // µs → 100ns
+        ms_pkt.Byte(b, 8)
+        for i := 0; i < 5; i = i + 1 {
+            ms_pkt.Byte(b, int((ticks >> (i * 8)) & int64(255)))
+        }
+        d := days + int64(719162)
+        ms_pkt.Byte(b, int(d & int64(255)))
+        ms_pkt.Byte(b, int((d >> 8) & int64(255)))
+        ms_pkt.Byte(b, int((d >> 16) & int64(255)))
+        return
+    }
+    // Text → NVARCHAR (u16 byte len + UTF-16LE).
+    s := dbx_value.Bytes(v)
+    n := str.Len(s)
+    ms_pkt.I16(b, n * 2)
+    ms_pkt.Ucs2(b, s)
+}

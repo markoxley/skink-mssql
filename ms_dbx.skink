@@ -1,0 +1,180 @@
+// File:    ms_dbx.skink
+// Purpose: dbx driver adapter for SQL Server. Registers a dbx.Driver
+//          under "mssql"/"sqlserver" so dbx.Open works. '?' params are
+//          rewritten to @P1..@Pn and bound through sp_executesql.
+module ms_dbx
+
+import "std/str"
+import "std/errors"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "ms_conn"
+import "ms_token"
+
+// ---- handle registry ---------------------------------------------------------
+
+var nextHandle = 0
+var handles = make(map[int]*ms_conn.Conn)
+
+fn boxConn(c: ms_conn.Conn) -> int64 {
+    nextHandle = nextHandle + 1
+    p := &ms_conn.Conn{}
+    *p = c
+    handles[nextHandle] = p
+    return int64(nextHandle)
+}
+
+fn unbox(h: int64) -> *ms_conn.Conn {
+    p, ok := handles[int(h)]
+    if !ok {
+        return nil
+    }
+    return p
+}
+
+fn drop(h: int64) {
+    _, ok := handles[int(h)]
+    if ok {
+        delete(handles, int(h))
+    }
+}
+
+// resultToRows maps a MsResult into dbx Rows.
+fn resultToRows(res: ms_token.MsResult) -> dbx_rows.Rows {
+    return dbx_rows.NewRows(res.Columns, res.Data)
+}
+
+// errOf surfaces a token-stream error as errors.Error.
+fn errOf(res: ms_token.MsResult) -> errors.Error {
+    if str.Len(res.ErrText) == 0 {
+        return errors.New("")
+    }
+    return errors.New(str.Concat("tds ", str.Concat(strconv.Itoa(res.ErrNum),
+        str.Concat(": ", res.ErrText))))
+}
+
+// ---- vtable -------------------------------------------------------------------
+
+fn queryImpl(self: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    c := unbox(self.State)
+    if c == nil {
+        return dbx_rows.EmptyRows([]string{}), errors.New("mssql: bad handle")
+    }
+    res, err := ms_conn.Query(c, sql, args)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), err
+    }
+    e := errOf(res)
+    if str.Len(e.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), e
+    }
+    return resultToRows(res), errors.New("")
+}
+
+fn execImpl(self: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    c := unbox(self.State)
+    if c == nil {
+        return int64(0), errors.New("mssql: bad handle")
+    }
+    return ms_conn.Exec(c, sql, args)
+}
+
+fn pingImpl(self: *dbx_driver.Conn) -> errors.Error {
+    c := unbox(self.State)
+    if c == nil {
+        return errors.New("mssql: bad handle")
+    }
+    return ms_conn.Ping(c)
+}
+
+fn closeImpl(self: *dbx_driver.Conn) -> errors.Error {
+    c := unbox(self.State)
+    if c == nil {
+        return errors.New("")
+    }
+    ms_conn.Close(c)
+    drop(self.State)
+    return errors.New("")
+}
+
+fn beginImpl(self: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    c := unbox(self.State)
+    if c == nil {
+        return dbx_driver.Tx{}, errors.New("mssql: bad handle")
+    }
+    err := ms_conn.Begin(c)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Tx{}, err
+    }
+    self.InTx = true
+    t := dbx_driver.Tx{State: self.State}
+    t.queryFn = txQueryImpl
+    t.execFn = txExecImpl
+    t.commitFn = txCommitImpl
+    t.rollbackFn = txRollbackImpl
+    return t, errors.New("")
+}
+
+fn txQueryImpl(tx: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    c := unbox(tx.State)
+    if c == nil {
+        return dbx_rows.EmptyRows([]string{}), errors.New("mssql: bad handle")
+    }
+    res, err := ms_conn.Query(c, sql, args)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), err
+    }
+    e := errOf(res)
+    if str.Len(e.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), e
+    }
+    return resultToRows(res), errors.New("")
+}
+
+fn txExecImpl(tx: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    c := unbox(tx.State)
+    if c == nil {
+        return int64(0), errors.New("mssql: bad handle")
+    }
+    return ms_conn.Exec(c, sql, args)
+}
+
+fn txCommitImpl(tx: *dbx_driver.Tx) -> errors.Error {
+    c := unbox(tx.State)
+    if c == nil {
+        return errors.New("mssql: bad handle")
+    }
+    return ms_conn.CommitTx(c)
+}
+
+fn txRollbackImpl(tx: *dbx_driver.Tx) -> errors.Error {
+    c := unbox(tx.State)
+    if c == nil {
+        return errors.New("mssql: bad handle")
+    }
+    return ms_conn.RollbackTx(c)
+}
+
+// openImpl is the dbx Driver.Open entry point.
+fn openImpl(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    conn, err := ms_conn.Connect(info)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Conn{}, err
+    }
+    dc := dbx_driver.Conn{Name: "mssql", State: boxConn(conn)}
+    dc.queryFn = queryImpl
+    dc.execFn = execImpl
+    dc.pingFn = pingImpl
+    dc.beginFn = beginImpl
+    dc.closeFn = closeImpl
+    return dc, errors.New("")
+}
+
+// Register installs the driver so dbx.Open("mssql://...") works.
+pub fn Register() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "mssql", Open: openImpl})
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "sqlserver", Open: openImpl})
+}

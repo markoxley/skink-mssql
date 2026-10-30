@@ -1,0 +1,18 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "mssql"
+version = "0.1.0"
+author = "mark"
+entry = "mssql.skink"
+description = "Microsoft SQL Server driver for Skink: pure-Skink TDS 7.x protocol (PRELOGIN, LOGIN7, SQLBatch, sp_executesql params, response token streams) and a dbx driver adapter"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
+"mod/markoxley/skink-dbx" = "0.1.0"

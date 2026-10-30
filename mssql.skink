@@ -1,0 +1,51 @@
+// File:    mssql.skink
+// Purpose: Root module for skink-mssql. Re-exports the connection and
+//          adapter entry points so applications need only
+//          `import "mod/markoxley/skink-mssql"`. Call mssql.Register()
+//          once to make "mssql://"/"sqlserver://" DSNs work through the
+//          generic dbx.Open entry point.
+module mssql
+
+import "ms_conn"
+import "ms_dbx"
+import "ms_token"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/errors"
+
+// Connect opens a connection from a parsed ConnInfo.
+// DSN form:
+//   mssql://[user[:pass]@]host[:port][/database][?encrypt=false]
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (ms_conn.Conn, errors.Error) {
+    return ms_conn.Connect(info)
+}
+
+// Dial parses a mssql:// DSN and connects.
+pub fn Dial(dsn: string) -> (ms_conn.Conn, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return ms_conn.Conn{}, err
+    }
+    return ms_conn.Connect(info)
+}
+
+// Batch runs a raw T-SQL batch.
+pub fn Batch(c: *ms_conn.Conn, sql: string) -> (ms_token.MsResult, errors.Error) {
+    return ms_conn.Batch(c, sql)
+}
+
+// Query runs sql with optional bound '?' params (sp_executesql).
+pub fn Query(c: *ms_conn.Conn, sql: string, args: []dbx_value.Value) -> (ms_token.MsResult, errors.Error) {
+    return ms_conn.Query(c, sql, args)
+}
+
+// Exec runs sql and returns the affected-row count.
+pub fn Exec(c: *ms_conn.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return ms_conn.Exec(c, sql, args)
+}
+
+// Register installs the "mssql"/"sqlserver" dbx drivers.
+pub fn Register() {
+    ms_dbx.Register()
+}

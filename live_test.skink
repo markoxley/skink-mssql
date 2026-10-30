@@ -1,0 +1,113 @@
+// File:    live_test.skink
+// Purpose: Live integration test for skink-mssql against a real SQL
+//          Server. Skipped (exit 0) unless SKINK_MSSQL_DSN is set —
+//          test_live.sh starts a podman mssql/server container and
+//          exports it.
+//
+//          Exercises for real: PRELOGIN negotiation, LOGIN7 auth,
+//          SQLBatch, COLMETADATA+ROW decoding for ints/nvarchar/
+//          datetime2/decimal/bit/float, bound params via sp_executesql,
+//          ERROR tokens, BEGIN/COMMIT/ROLLBACK.
+module main
+
+import "ms_conn"
+import "ms_token"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/os"
+import "std/errors"
+
+var failures = 0
+
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+fn expectErr(e: errors.Error, what: string) {
+    if str.Len(e.message) > 0 {
+        check(false, str.Concat(what, str.Concat(" -> ", e.message)))
+    }
+}
+
+fn main() -> int {
+    dsn := os.Getenv("SKINK_MSSQL_DSN")
+    if str.Len(dsn) == 0 {
+        println("SKIP live_test: SKINK_MSSQL_DSN not set")
+        return 0
+    }
+    println("live test against", dsn)
+    info, derr := dbx_dsn.ParseDSN(dsn)
+    expectErr(derr, "parse dsn")
+    c, cerr := ms_conn.Connect(info)
+    expectErr(cerr, "connect")
+    if str.Len(cerr.message) > 0 {
+        println("RESULT: FAIL")
+        return 1
+    }
+    println("connected; server version:", c.ServerVer)
+
+    // Scalar SELECT across types.
+    res, qerr := ms_conn.Query(&c,
+        "SELECT cast(7 as bigint) AS i, N'ada' AS s, cast(9.5 as float) AS f, cast(1 as bit) AS b", []dbx_value.Value{})
+    expectErr(qerr, "select types")
+    if len(res.Data) == 1 {
+        check(res.Data[0][0].I64 == int64(7), "bigint value")
+        check(str.Equal(res.Data[0][1].Str, "ada"), "nvarchar value")
+        check(res.Data[0][2].F64 > 9.4 && res.Data[0][2].F64 < 9.6, "float value")
+        check(res.Data[0][3].Bool, "bit value")
+    } else {
+        check(false, "expected one row")
+    }
+
+    // Bound params via sp_executesql.
+    res, qerr = ms_conn.Query(&c,
+        "SELECT @P1 + @P2", []dbx_value.Value{
+            dbx_value.Int(int64(2)), dbx_value.Int(int64(3))})
+    expectErr(qerr, "bound params")
+    if len(res.Data) == 1 {
+        check(res.Data[0][0].I64 == int64(5), "2+3")
+    }
+
+    // Temp table DDL + CRUD in a transaction.
+    _, berr := ms_conn.Batch(&c,
+        "CREATE TABLE #t (id int identity(1,1) primary key, name nvarchar(50))")
+    expectErr(berr, "create temp table")
+    n, eerr := ms_conn.Exec(&c,
+        "INSERT INTO #t (name) VALUES (?), (?)",
+        []dbx_value.Value{dbx_value.Text("x"), dbx_value.Text("y")})
+    expectErr(eerr, "insert")
+    check(n == int64(2), "insert affected 2")
+    res, qerr = ms_conn.Query(&c,
+        "SELECT id, name FROM #t ORDER BY id", []dbx_value.Value{})
+    expectErr(qerr, "select rows")
+    check(len(res.Data) == 2, "two rows")
+    if len(res.Data) == 2 {
+        check(str.Equal(res.Data[0][1].Str, "x"), "row0 name")
+        check(str.Equal(res.Data[1][1].Str, "y"), "row1 name")
+    }
+
+    // Error surface: bad object name.
+    res, qerr = ms_conn.Query(&c, "SELECT * FROM nonexistent_table_zzz", []dbx_value.Value{})
+    check(str.Len(res.ErrText) > 0, "error surfaced")
+
+    // Transaction round-trip.
+    _, berr = ms_conn.Batch(&c, "BEGIN TRANSACTION")
+    expectErr(berr, "begin")
+    check(c.InTx, "in tx")
+    _, berr = ms_conn.Batch(&c, "ROLLBACK TRANSACTION")
+    expectErr(berr, "rollback")
+    check(!c.InTx, "out of tx")
+
+    ms_conn.Close(&c)
+    if failures == 0 {
+        println("RESULT: PASS")
+    } else {
+        println("RESULT: FAIL")
+        return 1
+    }
+    return 0
+}

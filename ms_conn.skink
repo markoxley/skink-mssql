@@ -1,0 +1,664 @@
+// File:    ms_conn.skink
+// Purpose: SQL Server connection over pure-Skink TDS 7.x —
+//          PRELOGIN option negotiation, LOGIN7 (SQL auth with the
+//          obfuscated-password dance), SQLBatch queries, sp_executesql
+//          RPC for bound '?' parameters, transactions via T-SQL
+//          batches, and response token decoding.
+//
+//          Encryption: PRELOGIN negotiates ENCRYPT_OFF/NOT_SUP by
+//          default (?encrypt=false). A server that *requires*
+//          encryption gets an explicit error — TLS-inside-TDS is not
+//          implemented (see README).
+module ms_conn
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "ms_pkt"
+import "ms_type"
+import "ms_token"
+
+// prelogin token ids
+const PL_VERSION   = 0
+const PL_ENCRYPT   = 1
+const PL_INSTOPT   = 2
+const PL_THREADID  = 3
+const PL_MARS      = 4
+const PL_TERMINATE = 255
+
+// encryption negotiation values (MS-TDS PRELOGIN)
+const ENCRYPT_OFF     = 0 // server can encrypt, session stays clear
+const ENCRYPT_ON      = 1 // whole connection encrypted
+const ENCRYPT_NOT_SUP = 2 // client/server cannot encrypt at all
+const ENCRYPT_REQ     = 3 // server requires encryption
+
+// Conn is one TDS connection.
+pub struct Conn {
+    Bc:        dbx_bufconn.BufConn
+    Db:        string
+    ServerVer: string
+    InTx:      bool
+    TxDesc:    int64 // active TDS 7.2+ transaction descriptor (0 = none)
+    Encrypt:   int   // negotiated encryption mode
+}
+
+// ---- prelogin ---------------------------------------------------------------
+
+// prelogin sends the option table and parses the reply.
+fn prelogin(c: *Conn, wantEncrypt: bool) -> errors.Error {
+    // Version bytes: 6-byte build + 2-byte subbuild — send a generic
+    // 7.4 client version.
+    ver := libc.malloc(6)
+    // Zero-fill first — an uninitialized tail would leak heap bytes
+    // onto the wire.
+    libc.memset(ver, 0, 6)
+    // "15.0.2000.5": major=15, minor=0, build=2000 (BE u16), sub=5.
+    ver[0] = 15
+    ver[1] = 0
+    ver[2] = (2000 >> 8) & 255
+    ver[3] = 2000 & 255
+    ver[4] = 0
+    ver[5] = 5
+    // With encrypt=false we must declare ENCRYPT_NOT_SUP — advertising
+    // ENCRYPT_OFF (0) means "client supports TLS" and the server will
+    // then require the LOGIN7 packet itself be TLS-wrapped.
+    enc := ENCRYPT_NOT_SUP
+    if wantEncrypt {
+        enc = ENCRYPT_ON
+    }
+    // Options: VERSION(off,len) ENCRYPT(off,len) MARS(off,len) TERMINATE
+    b := ms_pkt.NewOutBuf(64)
+    // 3 options × 5 bytes + terminator
+    ms_pkt.Byte(&b, PL_VERSION)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 16)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 6)
+    ms_pkt.Byte(&b, PL_ENCRYPT)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 22)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 1)
+    ms_pkt.Byte(&b, PL_MARS)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 23)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 1)
+    ms_pkt.Byte(&b, PL_TERMINATE)
+    // payload
+    ms_pkt.WriteN(&b, ver, 6)
+    ms_pkt.Byte(&b, enc)
+    ms_pkt.Byte(&b, 0) // MARS off
+    libc.free(ver)
+    serr := ms_pkt.Send(&c.Bc, ms_pkt.PT_PRELOGIN, b.Buf, b.Len)
+    ms_pkt.Free(&b)
+    if str.Len(serr.message) > 0 {
+        return serr
+    }
+    body, n, _, rerr := ms_pkt.Recv(&c.Bc)
+    if str.Len(rerr.message) > 0 {
+        return rerr
+    }
+    // Parse the option table: u8 id, u16be off, u16be len, 0xFF.
+    r := ms_pkt.NewReader(body, n)
+    var offs []int
+    var lens []int
+    var ids []int
+    for r.Pos + 5 <= n {
+        id := ms_pkt.RByte(&r)
+        if id == PL_TERMINATE {
+            break
+        }
+        o := (ms_pkt.RByte(&r) << 8) | ms_pkt.RByte(&r)
+        l := (ms_pkt.RByte(&r) << 8) | ms_pkt.RByte(&r)
+        ids = append(ids, id)
+        offs = append(offs, o)
+        lens = append(lens, l)
+    }
+    for i := 0; i < len(ids); i = i + 1 {
+        if ids[i] == PL_ENCRYPT && offs[i] < n {
+            c.Encrypt = int(body[offs[i]]) & 255
+        }
+    }
+    if wantEncrypt {
+        return errors.New("tds: ?encrypt=true not supported — TLS-in-TDS unimplemented")
+    }
+    if c.Encrypt == ENCRYPT_ON || c.Encrypt == ENCRYPT_REQ {
+        return errors.New("tds: server requires encryption; TLS-in-TDS is not implemented — disable Force Encryption on the server")
+    }
+    if c.Encrypt == ENCRYPT_OFF {
+        // Server can encrypt and expects the LOGIN7 TLS-wrapped even
+        // though we declared no TLS support — treat as unsupported.
+        return errors.New("tds: server expects encrypted login (ENCRYPT_OFF); TLS-in-TDS unimplemented")
+    }
+    return errors.New("")
+}
+
+// ---- login7 ------------------------------------------------------------------
+
+// ucs2Field is one (offset,len) tracked UCS-2 field.
+struct fld {
+    str: string
+}
+
+// buildLogin7 assembles the LOGIN7 payload.
+fn buildLogin7(info: dbx_dsn.ConnInfo) -> (string, int) {
+    // Fixed header is 94 bytes, then the variable field area.
+    // Field pairs (off,len in UCS-2 chars) at fixed offsets 36..:
+    //   36 HostName, 40 UserName, 44 Password, 48 AppName,
+    //   52 ServerName, 56 Unused, 60 CltIntName, 64 Language,
+    //   68 Database, then ClientID(6B@72), 78 SSPI, 82 AtchDB,
+    //   86 ChangePassword, 88 cbSSPILong(u32)
+    b := ms_pkt.NewOutBuf(512)
+    // Zone A: first pass collects UCS-2 field bytes.
+    var fields []string
+    host := "skink-client"
+    app := "skink"
+    lib := "skink-tds"
+    pushFld(&fields, host)
+    pushFld(&fields, info.User)
+    obf := obfuscate(info.Password)
+    fields = append(fields, obf)
+    pushFld(&fields, app)
+    pushFld(&fields, info.Host)
+    pushFld(&fields, "")   // unused
+    pushFld(&fields, lib)
+    pushFld(&fields, "")   // language
+    pushFld(&fields, info.Database)
+    pushFld(&fields, "")   // sspi (empty → SQL auth)
+    pushFld(&fields, "")   // atchdb
+    pushFld(&fields, "")   // changepw
+
+    // Zone B: fixed 94-byte header with placeholders.
+    for i := 0; i < 94; i = i + 1 {
+        ms_pkt.Byte(&b, 0)
+    }
+    // Zone C: field data. fields[2] (password) is already-obfuscated
+    // raw UCS-2 bytes — emit verbatim, don't re-encode.
+    var offs []int
+    var lens []int
+    for i := 0; i < len(fields); i = i + 1 {
+        s := fields[i]
+        if i == 2 && str.Len(s) > 0 {
+            offs = append(offs, b.Len)
+            ms_pkt.WriteN(&b, s, str.Len(s))
+            lens = append(lens, str.Len(s) / 2)
+            continue
+        }
+        if str.Len(s) == 0 {
+            offs = append(offs, b.Len)
+            lens = append(lens, 0)
+            continue
+        }
+        offs = append(offs, b.Len)
+        pre := b.Len
+        ms_pkt.Ucs2(&b, s)
+        lens = append(lens, (b.Len - pre) / 2)
+    }
+    // Extension pair (fields[5]) unused → point at end of data, len 0.
+    offs[5] = b.Len
+    lens[5] = 0
+    total := b.Len
+    // Patch fixed header.
+    p := b.Buf
+    // length i32 LE at 0
+    patch32(p, 0, total)
+    // TDS version at 4 — little-endian DWORD, unlike the big-endian
+    // fields in PRELOGIN. 7.4 = 0x74000004 → bytes 04 00 00 74.
+    p[4] = 4
+    p[5] = 0
+    p[6] = 0
+    p[7] = 0x74
+    // packet size at 8 LE
+    patch32(p, 8, ms_pkt.PACKET_SIZE)
+    // client prog ver at 12 (4 bytes, LE-ish opaque) → zeros fine
+    // client pid at 16 → zeros
+    // conn id at 20 → 0
+    // OptionFlags1 (24) / OptionFlags2 (25) / TypeFlags (26) /
+    // OptionFlags3 (27). Match the MS-TDS sample: fByteOrder|fChar|
+    // fFloat|fUseDB|fSetLang in flags1 (0xE0); fLanguage|fODBC in
+    // flags2 (0x03). No fUserInstance, no integrated security.
+    p[24] = 0xE0
+    p[25] = 0x03
+    p[26] = 0x00
+    p[27] = 0x00
+    // ClientTimeZone (28) = 0; ClientLCID (32) = 1033 (en-US, LE).
+    p[32] = 0x09
+    p[33] = 0x04
+    // Field (offset,charlen) pairs: 9 pairs at 36..72
+    // (HostName..Database), ClientID occupies 72..78, then SSPI/
+    // AtchDB/ChangePw pairs at 78..90, cbSSPILong u32 at 90.
+    for i := 0; i < 9; i = i + 1 {
+        base := 36 + i * 4
+        p[base] = offs[i] & 255
+        p[base + 1] = (offs[i] >> 8) & 255
+        p[base + 2] = lens[i] & 255
+        p[base + 3] = (lens[i] >> 8) & 255
+    }
+    for i := 0; i < 3; i = i + 1 {
+        base := 78 + i * 4
+        idx := i + 9 // fields[9..11] = sspi/atchdb/changepw
+        p[base] = offs[idx] & 255
+        p[base + 1] = (offs[idx] >> 8) & 255
+        p[base + 2] = lens[idx] & 255
+        p[base + 3] = (lens[idx] >> 8) & 255
+    }
+    return b.Buf, total
+}
+
+// pushFld appends a raw (unobfuscated) UCS-2-able string field.
+fn pushFld(fields: *[]string, s: string) {
+    *fields = append(*fields, s)
+}
+
+// obfuscate applies the Login7 password scramble: swap nibbles, XOR 0xA5.
+fn obfuscate(s: string) -> string {
+    n := str.Len(s)
+    // Each char becomes a UCS-2 char; obfuscation applies per byte.
+    out := libc.malloc(n * 2 + 2)
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i]) & 255
+        lo := ((c << 4) | (c >> 4)) ^ 0xA5
+        hi := (((0 << 4) | (0 >> 4)) ^ 0xA5)
+        out[i * 2] = lo & 255
+        out[i * 2 + 1] = hi & 255
+    }
+    // Store the obfuscated bytes as a latin-1 string; buildLogin7 will
+    // emit them raw via a special path — encode as chars 0-255.
+    out[n * 2] = 0
+    return out
+}
+
+// patch32 writes a little-endian u32 into buffer bytes.
+fn patch32(p: string, off: int, v: int) {
+    p[off] = v & 255
+    p[off + 1] = (v >> 8) & 255
+    p[off + 2] = (v >> 16) & 255
+    p[off + 3] = (v >> 24) & 255
+}
+
+// ---- connect -----------------------------------------------------------------
+
+// Connect performs prelogin + Login7 + auth.
+// DSN: mssql://user:pass@host[:port][/database][?encrypt=false]
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (Conn, errors.Error) {
+    c := Conn{}
+    host := info.Host
+    if str.Len(host) == 0 {
+        host = "localhost"
+    }
+    port := dbx_dsn.PortOr(info, 1433)
+    bc, derr := dbx_bufconn.Dial(host, port, 10000)
+    if str.Len(derr.message) > 0 {
+        return c, derr
+    }
+    c.Bc = bc
+    c.Db = info.Database
+    if str.Len(c.Db) == 0 {
+        c.Db = "master"
+    }
+    wantEnc := str.Equal(dbx_dsn.ParamOr(info, "encrypt", "false"), "true")
+    perr := prelogin(&c, wantEnc)
+    if str.Len(perr.message) > 0 {
+            c.Bc.Close()
+        return c, perr
+    }
+    payload, plen := buildLogin7(info)
+    serr := ms_pkt.Send(&c.Bc, ms_pkt.PT_LOGIN7, payload, plen)
+    libc.free(payload)
+    if str.Len(serr.message) > 0 {
+        c.Bc.Close()
+        return c, serr
+    }
+    res, rerr := readResponse(&c)
+    if str.Len(rerr.message) > 0 {
+        c.Bc.Close()
+        return c, rerr
+    }
+    if str.Len(res.ErrText) > 0 {
+        msg := res.ErrText
+        c.Bc.Close()
+        return c, errors.New(str.Concat("tds ", str.Concat(strconv.Itoa(res.ErrNum),
+            str.Concat(": ", msg))))
+    }
+    if str.Len(res.ServerVer) > 0 {
+        c.ServerVer = res.ServerVer
+    }
+    c.InTx = res.InTx
+    return c, errors.New("")
+}
+
+// readResponse reads packets until EOM and parses the token stream.
+fn readResponse(c: *Conn) -> (ms_token.MsResult, errors.Error) {
+    res := ms_token.MsResult{}
+    body, n, _, err := ms_pkt.Recv(&c.Bc)
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+    perr := ms_token.ParseTokens(body, n, &res)
+    libc.free(body)
+    // ENVCHANGE is authoritative for tx state — but only when present.
+    // Ordinary in-tx responses carry no ENVCHANGE, so an absent token
+    // must leave c.TxDesc/c.InTx untouched (a missing DONE_INXACT flag
+    // may still *set* InTx).
+    if res.TxDescSeen {
+        c.TxDesc = res.TxDesc
+        c.InTx = res.InTx
+    } else if res.InTx {
+        c.InTx = true
+    }
+    return res, perr
+}
+
+// ---- queries -------------------------------------------------------------------
+
+// Batch runs a raw T-SQL batch, returning the last result set's rows.
+pub fn Batch(c: *Conn, sql: string) -> (ms_token.MsResult, errors.Error) {
+    // ALL_HEADERS: total length (u32) + TransactionDescriptor header
+    // (u16 datalen=18, u16 type=2, u64 txdesc, u32 outstanding-req
+    // count=1). The descriptor is REQUIRED by TDS 7.2+ — omitting it
+    // makes the server reject the batch with "MARS TDS header missing".
+    b := ms_pkt.NewOutBuf(str.Len(sql) * 2 + 32)
+    ms_pkt.I32(&b, int64(22))    // TotalLength (u32, incl. itself)
+    ms_pkt.I32(&b, int64(18))    // HeaderDataLength (u32)
+    ms_pkt.I16(&b, 2)            // HeaderType = TransactionDescriptor
+    ms_pkt.I64(&b, c.TxDesc)
+    ms_pkt.I32(&b, int64(1))     // OutstandingRequestCount
+    ms_pkt.Ucs2(&b, sql)
+    serr := ms_pkt.Send(&c.Bc, ms_pkt.PT_SQL_BATCH, b.Buf, b.Len)
+    ms_pkt.Free(&b)
+    if str.Len(serr.message) > 0 {
+        return ms_token.MsResult{}, serr
+    }
+    return readResponse(c)
+}
+
+// RewritePlaceholders converts '?' into @P1..@Pn, skipping quoted
+// strings and comments.
+pub fn RewritePlaceholders(sql: string) -> string {
+    out := ""
+    n := str.Len(sql)
+    p := 0
+    i := 0
+    for i < n {
+        c := sql[i]
+        if c == 39 { // '...' — '' inside doubles the quote, not closes
+            j := i + 1
+            for j < n {
+                if sql[j] == 39 {
+                    if j + 1 < n && sql[j + 1] == 39 {
+                        j = j + 2
+                        continue
+                    }
+                    j = j + 1 // closing quote
+                    break
+                }
+                j = j + 1
+            }
+            out = str.Concat(out, str.Substr(sql, i, j - i))
+            i = j
+            continue
+        }
+        if c == 45 && i + 1 < n && sql[i + 1] == 45 { // -- line comment
+            j := i
+            for j < n && sql[j] != 10 {
+                j = j + 1
+            }
+            out = str.Concat(out, str.Substr(sql, i, j - i))
+            i = j
+            continue
+        }
+        if c == 47 && i + 1 < n && sql[i + 1] == 42 { // /* block */
+            j := i + 2
+            for j + 1 < n && !(sql[j] == 42 && sql[j + 1] == 47) {
+                j = j + 1
+            }
+            j = j + 2
+            if j > n {
+                j = n
+            }
+            out = str.Concat(out, str.Substr(sql, i, j - i))
+            i = j
+            continue
+        }
+        if c == 63 { // '?'
+            p = p + 1
+            out = str.Concat(out, str.Concat("@P", strconv.Itoa(p)))
+            i = i + 1
+            continue
+        }
+        out = str.Concat(out, str.Substr(sql, i, 1))
+        i = i + 1
+    }
+    return out
+}
+
+// Query runs sql; with args it uses sp_executesql via SQL batch text.
+// (RPC path exists but building a param-decl list then interpolating
+// typed literals via a batch is equally safe — the literals are
+// escaped by EncodeLiteral.)
+pub fn Query(c: *Conn, sql: string, args: []dbx_value.Value) -> (ms_token.MsResult, errors.Error) {
+    if len(args) == 0 {
+        return Batch(c, sql)
+    }
+    rw := RewritePlaceholders(sql)
+    decl := ""
+    call := ""
+    for i := 0; i < len(args); i = i + 1 {
+        name := str.Concat("@P", strconv.Itoa(i + 1))
+        if i > 0 {
+            decl = str.Concat(decl, ",")
+            call = str.Concat(call, ",")
+        }
+        decl = str.Concat(decl, str.Concat(name, str.Concat(" ", declType(args[i]))))
+        call = str.Concat(call, str.Concat(name, str.Concat("=", literalFor(args[i]))))
+    }
+    escSql := escapeApos(rw)
+    escDecl := escapeApos(decl)
+    cmd := str.Concat("EXEC sp_executesql N'", str.Concat(escSql,
+        str.Concat("', N'", str.Concat(escDecl, str.Concat("'", str.Concat(",", call))))))
+    return Batch(c, cmd)
+}
+
+// Exec runs sql and returns the DONE row count.
+pub fn Exec(c: *Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    res, err := Query(c, sql, args)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    if str.Len(res.ErrText) > 0 {
+        return int64(0), errors.New(res.ErrText)
+    }
+    return res.Affected, errors.New("")
+}
+
+// declType maps a bound param to its sp_executesql declaration type.
+fn declType(v: dbx_value.Value) -> string {
+    if v.Kind == dbx_value.KIND_INT {
+        return "bigint"
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        return "bit"
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        return "float"
+    }
+    if v.Kind == dbx_value.KIND_TIME {
+        return "datetime2"
+    }
+    if v.Kind == dbx_value.KIND_BLOB {
+        return "varbinary(max)"
+    }
+    return "nvarchar(max)"
+}
+
+// literalFor renders a value as a T-SQL literal for sp_executesql args.
+fn literalFor(v: dbx_value.Value) -> string {
+    if dbx_value.IsNull(v) {
+        return "NULL"
+    }
+    if v.Kind == dbx_value.KIND_INT {
+        return strconv.Itoa64(v.I64)
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        if v.Bool {
+            return "cast(1 as bit)"
+        }
+        return "cast(0 as bit)"
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        return strconv.FormatFloat(v.F64, 17)
+    }
+    if v.Kind == dbx_value.KIND_TIME {
+        return str.Concat("cast('", str.Concat(formatMicrosTds(v.I64),
+            "' as datetime2)"))
+    }
+    if v.Kind == dbx_value.KIND_BLOB {
+        hex := "0123456789abcdef"
+        s := dbx_value.Bytes(v)
+        out := "0x"
+        for i := 0; i < v.Len; i = i + 1 {
+            c := int(s[i]) & 255
+            out = str.Concat(out, str.Concat(str.Substr(hex, c >> 4, 1),
+                str.Substr(hex, c & 15, 1)))
+        }
+        return out
+    }
+    s := dbx_value.Bytes(v)
+    return str.Concat("N'", str.Concat(escapeApos(s), "'"))
+}
+
+// escapeApos doubles single quotes.
+fn escapeApos(s: string) -> string {
+    out := ""
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        if s[i] == 39 {
+            out = str.Concat(out, "''")
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+        }
+    }
+    return out
+}
+
+// formatMicrosTds renders micros as 'YYYY-MM-DD HH:MM:SS.ffffff'.
+fn formatMicrosTds(us: int64) -> string {
+    days := us / int64(86400000000)
+    rem := us % int64(86400000000)
+    if rem < 0 {
+        rem = rem + int64(86400000000)
+        days = days - 1
+    }
+    y, mo, dy := civilFromDays(days)
+    secs := rem / int64(1000000)
+    frac := rem % int64(1000000)
+    date := str.Concat(pad4(y), str.Concat("-", str.Concat(pad2(mo),
+        str.Concat("-", pad2(dy)))))
+    tm := str.Concat(pad2(int(secs / 3600)), str.Concat(":",
+        str.Concat(pad2(int((secs % 3600) / 60)), str.Concat(":",
+        str.Concat(pad2(int(secs % 60)), str.Concat(".", pad6(int(frac))))))))
+    return str.Concat(date, str.Concat(" ", tm))
+}
+
+// civilFromDays inverts days-from-civil (Hinnant).
+fn civilFromDays(z: int64) -> (int, int, int) {
+    zz := z + int64(719468)
+    era := zz / int64(146097)
+    if zz < 0 && zz % int64(146097) != 0 {
+        era = era - 1
+    }
+    doe := zz - era * int64(146097)
+    yoe := (doe - doe / int64(1460) + doe / int64(36524) - doe / int64(146096)) / int64(365)
+    y := yoe + era * int64(400)
+    doy := doe - (int64(365) * yoe + yoe / int64(4) - yoe / int64(100))
+    mp := (int64(5) * doy + int64(2)) / int64(153)
+    d := doy - (int64(153) * mp + int64(2)) / int64(5) + int64(1)
+    m := mp + int64(3)
+    if mp >= int64(10) {
+        m = mp - int64(9)
+    }
+    if m <= int64(2) {
+        y = y + 1
+    }
+    return int(y), int(m), int(d)
+}
+
+fn pad2(v: int) -> string {
+    if v < 10 {
+        return str.Concat("0", strconv.Itoa64(int64(v)))
+    }
+    return strconv.Itoa64(int64(v))
+}
+
+fn pad4(v: int) -> string {
+    s := strconv.Itoa64(int64(v))
+    for str.Len(s) < 4 {
+        s = str.Concat("0", s)
+    }
+    return s
+}
+
+fn pad6(v: int) -> string {
+    s := strconv.Itoa64(int64(v))
+    for str.Len(s) < 6 {
+        s = str.Concat("0", s)
+    }
+    return s
+}
+
+// ---- transactions / misc -------------------------------------------------------
+
+// Begin starts a transaction via T-SQL.
+pub fn Begin(c: *Conn) -> errors.Error {
+    res, err := Batch(c, "BEGIN TRANSACTION")
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    if str.Len(res.ErrText) > 0 {
+        return errors.New(res.ErrText)
+    }
+    c.InTx = res.InTx
+    return errors.New("")
+}
+
+// CommitTx commits.
+pub fn CommitTx(c: *Conn) -> errors.Error {
+    res, err := Batch(c, "COMMIT TRANSACTION")
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    if str.Len(res.ErrText) > 0 {
+        return errors.New(res.ErrText)
+    }
+    c.InTx = res.InTx
+    return errors.New("")
+}
+
+// RollbackTx rolls back.
+pub fn RollbackTx(c: *Conn) -> errors.Error {
+    res, err := Batch(c, "ROLLBACK TRANSACTION")
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    if str.Len(res.ErrText) > 0 {
+        return errors.New(res.ErrText)
+    }
+    c.InTx = res.InTx
+    return errors.New("")
+}
+
+// Ping runs SELECT 1.
+pub fn Ping(c: *Conn) -> errors.Error {
+    _, err := Batch(c, "SELECT 1")
+    return err
+}
+
+// Close releases the socket.
+pub fn Close(c: *Conn) {
+    c.Bc.Close()
+}

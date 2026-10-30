@@ -1,0 +1,103 @@
+// File:    dbx_test.skink
+// Purpose: Tests for the ms_dbx adapter — driver registration under
+//          both "mssql" and "sqlserver" schemes, dbx.Open dispatch,
+//          Query/Exec over T-SQL, and transactions through dbx.Tx.
+module dbx_test
+
+import "ms_pkt"
+import "ms_type"
+import "ms_dbx"
+import "ms_token"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/testing"
+import "std/waitgroup"
+
+// responder returns one int column "n" = 42 for any batch.
+fn dbxResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(64)
+    metas := []ms_type.ColMeta{
+        ms_type.ColMeta{Name: "n", Type: ms_type.T_INTN},
+    }
+    testkit.ColTok(&b, metas)
+    testkit.RowTok(&b, metas, []string{"42"}, []bool{false})
+    testkit.DoneInto(&b, 0, int64(0))
+    return b
+}
+
+// TestOpenQuery runs dbx.Open("mssql://...") → Query → row decode.
+pub fn TestOpenQuery() {
+    fs, wg, _ := testkit.StartFakeServer(15811)
+    spawn testkit.Serve(&fs, 1, dbxResponder, wg)
+    ms_dbx.Register()
+    conn, err := dbx_driver.Open("mssql://sa:pw@127.0.0.1:15811/app")
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("open: ", err.message))
+    testing.AssertEqualString("mssql", conn.Name, "driver name")
+    rows, qerr := conn.Query("SELECT 42", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(qerr.message) == 0, "query")
+    testing.AssertTrue(rows.Next(), "has row")
+    testing.AssertTrue(rows.Int64("n") == int64(42), "n value")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestSqlserverAlias confirms the sqlserver:// scheme resolves too.
+pub fn TestSqlserverAlias() {
+    fs, wg, _ := testkit.StartFakeServer(15812)
+    spawn testkit.Serve(&fs, 1, dbxResponder, wg)
+    ms_dbx.Register()
+    conn, err := dbx_driver.Open("sqlserver://sa:pw@127.0.0.1:15812/app")
+    testing.AssertTrue(str.Len(err.message) == 0, "alias open")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestExecAffected covers Exec returning a DONE rowcount.
+pub fn TestExecAffected() {
+    fs, wg, _ := testkit.StartFakeServer(15813)
+    spawn testkit.Serve(&fs, 1, execResponder, wg)
+    ms_dbx.Register()
+    conn, _ := dbx_driver.Open("mssql://sa:pw@127.0.0.1:15813/app")
+    n, err := conn.Exec("UPDATE t SET x = 1", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) == 0, "exec")
+    testing.AssertTrue(n == int64(9), "affected")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+fn execResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(32)
+    testkit.DoneInto(&b, ms_token.DONE_COUNT, int64(9))
+    return b
+}
+
+// TestDbxTx drives Begin → tx.Exec → Commit through dbx.
+pub fn TestDbxTx() {
+    fs, wg, _ := testkit.StartFakeServer(15814)
+    spawn testkit.Serve(&fs, 3, txResponder, wg)
+    ms_dbx.Register()
+    conn, _ := dbx_driver.Open("mssql://sa:pw@127.0.0.1:15814/app")
+    tx, berr := conn.Begin()
+    testing.AssertTrue(str.Len(berr.message) == 0, "begin")
+    n, eerr := tx.Exec("UPDATE t SET x = 2", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(eerr.message) == 0, "tx exec")
+    testing.AssertTrue(n == int64(1), "tx affected")
+    cerr := tx.Commit()
+    testing.AssertTrue(str.Len(cerr.message) == 0, "commit")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+fn txResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(32)
+    if str.Contains(req.Sql, "BEGIN") {
+        testkit.DoneInto(&b, ms_token.DONE_INXACT, int64(0))
+    } else if str.Contains(req.Sql, "UPDATE") {
+        testkit.DoneInto(&b, ms_token.DONE_COUNT, int64(1))
+    } else {
+        testkit.DoneInto(&b, 0, int64(0))
+    }
+    return b
+}

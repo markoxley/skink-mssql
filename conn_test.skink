@@ -1,0 +1,224 @@
+// File:    conn_test.skink
+// Purpose: Integration tests for ms_conn/ms_token/ms_type against the
+//          scripted fake TDS backend — prelogin + LOGIN7 handshake,
+//          SQLBatch, COLMETADATA/ROW decoding across types, bound
+//          params via sp_executesql, ERROR tokens, transactions.
+module conn_test
+
+import "ms_pkt"
+import "ms_type"
+import "ms_conn"
+import "ms_token"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/libc"
+import "std/testing"
+import "std/waitgroup"
+import "std/errors"
+
+var lastReq testkit.MsReq
+
+// TestConnectBatch covers prelogin + login7 + one batch.
+pub fn TestConnectBatch() {
+    fs, wg, serr := testkit.StartFakeServer(15801)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 1, batchResponder, wg)
+
+    info, _ := dbx_dsn.ParseDSN("mssql://sa:pw@127.0.0.1:15801/app")
+    c, cerr := ms_conn.Connect(info)
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("connect: ", cerr.message))
+    testing.AssertEqualString("16.0", c.ServerVer, "server version")
+
+    _, qerr := ms_conn.Batch(&c, "SELECT 1")
+    testing.AssertTrue(str.Len(qerr.message) == 0, "batch")
+    testing.AssertEqualString("SELECT 1", lastReq.Sql, "sql on wire")
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+fn batchResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    lastReq = req
+    b := ms_pkt.NewOutBuf(64)
+    var metas []ms_type.ColMeta
+    testkit.ColTok(&b, metas)
+    testkit.DoneInto(&b, 0, int64(0))
+    return b
+}
+
+// TestResultRows decodes a COLMETADATA + 2 rows across types.
+pub fn TestResultRows() {
+    fs, wg, _ := testkit.StartFakeServer(15802)
+    spawn testkit.Serve(&fs, 1, rowsResponder, wg)
+    info, _ := dbx_dsn.ParseDSN("mssql://sa:pw@127.0.0.1:15802/app")
+    c, _ := ms_conn.Connect(info)
+    res, err := ms_conn.Query(&c, "SELECT id, name, score, flag FROM t", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) == 0, "query")
+    testing.AssertEqualInt(4, len(res.Columns), "columns")
+    testing.AssertEqualInt(2, len(res.Data), "rows")
+    testing.AssertTrue(res.Data[0][0].I64 == int64(7), "id int")
+    testing.AssertEqualString("ada", res.Data[0][1].Str, "name nvarchar")
+    testing.AssertEqualFloat(9.5, res.Data[0][2].F64, "score float")
+    testing.AssertTrue(res.Data[0][3].Bool, "flag bit")
+    testing.AssertTrue(dbx_value.IsNull(res.Data[1][1]), "null name")
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+fn rowsResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    lastReq = req
+    b := ms_pkt.NewOutBuf(128)
+    metas := []ms_type.ColMeta{
+        ms_type.ColMeta{Name: "id", Type: ms_type.T_INTN},
+        ms_type.ColMeta{Name: "name", Type: ms_type.T_NVARCHAR, MaxLen: 400},
+        ms_type.ColMeta{Name: "score", Type: ms_type.T_FLTN},
+        ms_type.ColMeta{Name: "flag", Type: ms_type.T_BITN},
+    }
+    testkit.ColTok(&b, metas)
+    testkit.RowTok(&b, metas, []string{"7", "ada", "9.5", "1"}, []bool{false, false, false, false})
+    testkit.RowTok(&b, metas, []string{"8", "", "1.0", "0"}, []bool{false, true, false, false})
+    testkit.DoneInto(&b, 0, int64(0))
+    return b
+}
+
+// TestDecimalAndDatetime covers decimal/numeric + datetime2 decoding.
+pub fn TestDecimalAndDatetime() {
+    fs, wg, _ := testkit.StartFakeServer(15803)
+    spawn testkit.Serve(&fs, 1, dtResponder, wg)
+    info, _ := dbx_dsn.ParseDSN("mssql://sa:pw@127.0.0.1:15803/app")
+    c, _ := ms_conn.Connect(info)
+    res, err := ms_conn.Query(&c, "SELECT price, stamp FROM t", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) == 0, "query")
+    if len(res.Data) == 1 {
+        testing.AssertEqualString("-12.34", res.Data[0][0].Str, "decimal text")
+        testing.AssertTrue(res.Data[0][1].Kind == dbx_value.KIND_TIME, "datetime2 kind")
+        testing.AssertTrue(res.Data[0][1].I64 == int64(1709258400123456), "datetime2 micros")
+    } else {
+        testing.Fail()
+    }
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+fn dtResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(128)
+    metas := []ms_type.ColMeta{
+        ms_type.ColMeta{Name: "price", Type: ms_type.T_DECIMALN, Precision: 9, Scale: 2},
+        ms_type.ColMeta{Name: "stamp", Type: ms_type.T_DATETIME2, Scale: 7},
+    }
+    testkit.ColTok(&b, metas)
+    testkit.RowTok(&b, metas,
+        []string{"-12.34", "2024-03-01 02:00:00.123456"},
+        []bool{false, false})
+    testkit.DoneInto(&b, 0, int64(0))
+    return b
+}
+
+// TestBoundParams runs '?' params through sp_executesql — the wire
+// text must carry the rewritten SQL + typed decls + literals.
+pub fn TestBoundParams() {
+    fs, wg, _ := testkit.StartFakeServer(15804)
+    spawn testkit.Serve(&fs, 1, paramResponder, wg)
+    info, _ := dbx_dsn.ParseDSN("mssql://sa:pw@127.0.0.1:15804/app")
+    c, _ := ms_conn.Connect(info)
+    _, err := ms_conn.Query(&c, "SELECT * FROM t WHERE a = ? AND b = ?",
+        []dbx_value.Value{dbx_value.Int(int64(5)), dbx_value.Text("it's")})
+    testing.AssertTrue(str.Len(err.message) == 0, "query")
+    testing.AssertContains(lastReq.Sql, "sp_executesql", "sp_executesql used")
+    testing.AssertContains(lastReq.Sql, "WHERE a = @P1 AND b = @P2", "rewritten")
+    testing.AssertContains(lastReq.Sql, "@P1 bigint", "decl typed")
+    testing.AssertContains(lastReq.Sql, "@P2 nvarchar(max)", "decl 2")
+    testing.AssertContains(lastReq.Sql, "@P1=5", "literal 5")
+    testing.AssertContains(lastReq.Sql, "N'it''s'", "escaped literal")
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+fn paramResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    lastReq = req
+    b := ms_pkt.NewOutBuf(64)
+    var metas []ms_type.ColMeta
+    testkit.ColTok(&b, metas)
+    testkit.DoneInto(&b, 0, int64(0))
+    return b
+}
+
+// TestErrorToken maps ERROR tokens into MsResult.ErrText.
+pub fn TestErrorToken() {
+    fs, wg, _ := testkit.StartFakeServer(15805)
+    spawn testkit.Serve(&fs, 1, errResponder, wg)
+    info, _ := dbx_dsn.ParseDSN("mssql://sa:pw@127.0.0.1:15805/app")
+    c, _ := ms_conn.Connect(info)
+    res, err := ms_conn.Query(&c, "SELECT * FROM nope", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) == 0, "protocol ok")
+    testing.AssertContains(res.ErrText, "Invalid object name", "errmsg")
+    testing.AssertEqualInt(208, res.ErrNum, "errno")
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+fn errResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(96)
+    testkit.ErrTok(&b, 208, 1, 16, "Invalid object name 'nope'.")
+    testkit.DoneInto(&b, ms_token.DONE_ERROR, int64(0))
+    return b
+}
+
+// TestTxFlow covers BEGIN/COMMIT batches and InTx tracking.
+pub fn TestTxFlow() {
+    fs, wg, _ := testkit.StartFakeServer(15806)
+    spawn testkit.Serve(&fs, 2, txResponder, wg)
+    info, _ := dbx_dsn.ParseDSN("mssql://sa:pw@127.0.0.1:15806/app")
+    c, _ := ms_conn.Connect(info)
+    berr := ms_conn.Begin(&c)
+    testing.AssertTrue(str.Len(berr.message) == 0, "begin")
+    testing.AssertTrue(c.InTx, "in tx after begin")
+    cerr := ms_conn.CommitTx(&c)
+    testing.AssertTrue(str.Len(cerr.message) == 0, "commit")
+    testing.AssertFalse(c.InTx, "out of tx after commit")
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+fn txResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    lastReq = req
+    b := ms_pkt.NewOutBuf(32)
+    if str.Contains(req.Sql, "BEGIN") {
+        testkit.DoneInto(&b, ms_token.DONE_INXACT, int64(0))
+    } else {
+        testkit.DoneInto(&b, 0, int64(0))
+    }
+    return b
+}
+
+// TestPlaceholderRewrite covers quoting/comment edge cases.
+pub fn TestPlaceholderRewrite() {
+    rw := ms_conn.RewritePlaceholders("SELECT '?' , a -- ? comment\nFROM t WHERE x = ? /* ? */ AND y = ?")
+    testing.AssertContains(rw, "'?'", "quoted ? kept")
+    testing.AssertContains(rw, "-- ? comment", "comment kept")
+    testing.AssertContains(rw, "/* ? */", "block kept")
+    testing.AssertContains(rw, "x = @P1", "first param")
+    testing.AssertContains(rw, "y = @P2", "second param")
+}
+
+// TestRewriteEscapedQuote — regression: '' inside a '...' literal is an
+// escaped quote, not the end of the string — '?' after it must stay
+// literal.
+pub fn TestRewriteEscapedQuote() {
+    got := ms_conn.RewritePlaceholders("SELECT 'it''s ?', ?")
+    testing.AssertEqualString("SELECT 'it''s ?', @P1", got, "escaped quote then real ?")
+}
+
+// TestRUcs2Clamp — regression: a declared UCS-2 length past the buffer
+// must clamp instead of reading out of bounds.
+pub fn TestRUcs2Clamp() {
+    // UTF-16LE 'A' = 0x41 0x00, built raw (no \x escapes in Skink).
+    buf := libc.malloc(3)
+    buf[0] = 65
+    buf[1] = 0
+    buf[2] = 0
+    r := ms_pkt.NewReader(buf, 2)
+    s := ms_pkt.RUcs2(&r, 4000)
+    testing.AssertEqualString("A", s, "clamped UCS-2 read")
+}

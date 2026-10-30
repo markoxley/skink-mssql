@@ -1,0 +1,519 @@
+// File:    testkit.skink
+// Purpose: In-process fake SQL Server for unit tests. Replies to
+//          PRELOGIN with a canned option table (ENCRYPT_NOT_SUP),
+//          accepts LOGIN7 with LOGINACK+DONE, then for each SQL_BATCH
+//          decodes the UCS-2 text and calls a responder returning
+//          prebuilt token-stream payloads to send back.
+//
+//          Token builders mirror the real wire formats: COLMETADATA
+//          with type-info, ROW with per-type encodings, ERROR/INFO,
+//          DONE with row counts.
+module testkit
+
+import "std/str"
+import "std/libc"
+import "std/strconv"
+import "std/net"
+import "std/errors"
+import "std/waitgroup"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "ms_pkt"
+import "ms_type"
+import "ms_token"
+
+// FakeServer is a scripted TDS backend on one loopback port.
+pub struct FakeServer {
+    listener: net.Connection
+    Port:     int
+}
+
+// MsReq is one decoded client command.
+pub struct MsReq {
+    Ptype: int    // packet type (1=batch, 16=login7, 18=prelogin)
+    Sql:   string // batch text (decoded UCS-2→UTF-8)
+}
+
+// ---- response payload builders ---------------------------------------------
+
+// DoneTok builds DONE(status, curcmd=0, count).
+pub fn DoneTok(status: int, count: int64) -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(16)
+    ms_pkt.Byte(&b, ms_token.TK_DONE)
+    ms_pkt.I16(&b, status)
+    ms_pkt.I16(&b, 0)
+    ms_pkt.I64(&b, count)
+    return b
+}
+
+// DoneDoneTok appends a DONE onto an existing buffer.
+pub fn DoneInto(b: *ms_pkt.OutBuf, status: int, count: int64) {
+    ms_pkt.Byte(b, ms_token.TK_DONE)
+    ms_pkt.I16(b, status)
+    ms_pkt.I16(b, 0)
+    ms_pkt.I64(b, count)
+}
+
+// ErrTok builds an ERROR token payload.
+pub fn ErrTok(b: *ms_pkt.OutBuf, num: int, state: int, class: int, msg: string) {
+    ms_pkt.Byte(b, ms_token.TK_ERROR)
+    lenPos := b.Len
+    ms_pkt.I16(b, 0) // len placeholder
+    start := b.Len
+    ms_pkt.I32(b, int64(num))
+    ms_pkt.Byte(b, state)
+    ms_pkt.Byte(b, class)
+    ms_pkt.I16(b, str.Len(msg))
+    ms_pkt.Ucs2(b, msg)
+    ms_pkt.Byte(b, 0) // server name len 0
+    ms_pkt.Byte(b, 0) // proc name len 0
+    ms_pkt.I16(b, 1)  // line number
+    patch16(b, lenPos, b.Len - start)
+}
+
+// InfoTok builds an INFO token.
+pub fn InfoTok(b: *ms_pkt.OutBuf, num: int, msg: string) {
+    ms_pkt.Byte(b, ms_token.TK_INFO)
+    lenPos := b.Len
+    ms_pkt.I16(b, 0)
+    start := b.Len
+    ms_pkt.I32(b, int64(num))
+    ms_pkt.Byte(b, 0)
+    ms_pkt.Byte(b, 0)
+    ms_pkt.I16(b, str.Len(msg))
+    ms_pkt.Ucs2(b, msg)
+    ms_pkt.Byte(b, 0)
+    ms_pkt.Byte(b, 0)
+    ms_pkt.I16(b, 0)
+    patch16(b, lenPos, b.Len - start)
+}
+
+// LoginAckTok builds LOGINACK (interface 0, tds ver, progname, version).
+pub fn LoginAckTok(b: *ms_pkt.OutBuf, major: int, minor: int) {
+    ms_pkt.Byte(b, ms_token.TK_LOGINACK)
+    lenPos := b.Len
+    ms_pkt.I16(b, 0)
+    start := b.Len
+    ms_pkt.Byte(b, 0)              // interface = SQL
+    ms_pkt.I32(b, int64(0x74000004)) // TDS version (LE write — content opaque)
+    ms_pkt.Byte(b, 7)
+    ms_pkt.Ucs2(b, "fakemss")
+    ms_pkt.Byte(b, major)          // version bytes BE order
+    ms_pkt.Byte(b, minor)
+    ms_pkt.Byte(b, 0)
+    ms_pkt.Byte(b, 0)
+    patch16(b, lenPos, b.Len - start)
+}
+
+// EnvChangeTok builds a trivial ENVCHANGE (type 20 routing → skipped).
+pub fn EnvChangeTok(b: *ms_pkt.OutBuf) {
+    ms_pkt.Byte(b, ms_token.TK_ENVCHANGE)
+    lenPos := b.Len
+    ms_pkt.I16(b, 0)
+    start := b.Len
+    ms_pkt.Byte(b, 18) // "packet size" change
+    ms_pkt.Byte(b, 5)  // new len bytes
+    ms_pkt.Ucs2(b, "4096")
+    ms_pkt.Byte(b, 4)  // old len bytes
+    ms_pkt.WriteN(b, "4096", 4)
+    patch16(b, lenPos, b.Len - start)
+}
+
+// ColTok appends a COLMETADATA token for the given column specs.
+// Each spec: (name, tdsType, maxlen, precision, scale).
+pub fn ColTok(b: *ms_pkt.OutBuf, metas: []ms_type.ColMeta) {
+    ms_pkt.Byte(b, ms_token.TK_COLMETADATA)
+    ms_pkt.I16(b, len(metas))
+    for i := 0; i < len(metas); i = i + 1 {
+        m := metas[i]
+        ms_pkt.I32(b, int64(0))   // usertype — ULONG for TDS 7.3+
+        ms_pkt.I16(b, 1)          // flags: nullable
+        ms_pkt.Byte(b, m.Type)
+        writeTypeInfo(b, m)
+        ms_pkt.Byte(b, str.Len(m.Name))
+        ms_pkt.Ucs2(b, m.Name)
+    }
+}
+
+// writeTypeInfo mirrors ms_type.ParseTypeInfo for encoding.
+fn writeTypeInfo(b: *ms_pkt.OutBuf, m: ms_type.ColMeta) {
+    t := m.Type
+    if t == ms_type.T_DECIMALN || t == ms_type.T_NUMERICN {
+        ms_pkt.Byte(b, 17)
+        ms_pkt.Byte(b, m.Precision)
+        ms_pkt.Byte(b, m.Scale)
+        return
+    }
+    if t == ms_type.T_INTN || t == ms_type.T_BITN || t == ms_type.T_FLTN ||
+        t == ms_type.T_MONEYN || t == ms_type.T_DATETIMN {
+        ms_pkt.Byte(b, m.MaxLen)
+        return
+    }
+    if t == ms_type.T_TIME || t == ms_type.T_DATETIME2 || t == ms_type.T_DATETIMEOFF {
+        ms_pkt.Byte(b, m.Scale)
+        return
+    }
+    if t == ms_type.T_VARCHAR || t == 0x2F || t == 0x25 || t == 0x2D {
+        ms_pkt.I16(b, m.MaxLen)
+        return
+    }
+    if t == ms_type.T_BIGVARCHAR || t == ms_type.T_BIGCHAR ||
+        t == ms_type.T_NVARCHAR || t == ms_type.T_NCHAR {
+        ms_pkt.I16(b, m.MaxLen)
+        ms_pkt.WriteN(b, collBytes(), 5)
+        return
+    }
+    if t == ms_type.T_BIGVARBINARY || t == ms_type.T_BIGBINARY {
+        ms_pkt.I16(b, m.MaxLen)
+        return
+    }
+}
+
+// collBytes returns a canned 5-byte collation.
+fn collBytes() -> string {
+    s := libc.malloc(5)
+    s[0] = 0x09
+    s[1] = 0x04
+    s[2] = 0xD0
+    s[3] = 0
+    s[4] = 0
+    return s
+}
+
+// RowTok appends a ROW token: each cell encoded per column type.
+pub fn RowTok(b: *ms_pkt.OutBuf, metas: []ms_type.ColMeta, vals: []string, nulls: []bool) {
+    ms_pkt.Byte(b, ms_token.TK_ROW)
+    for i := 0; i < len(metas); i = i + 1 {
+        encodeCell(b, metas[i], vals[i], nulls[i])
+    }
+}
+
+// encodeCell writes one row value. vals[i] is a text form; binary-ish
+// columns (INTN widths) are encoded from it.
+fn encodeCell(b: *ms_pkt.OutBuf, m: ms_type.ColMeta, v: string, isNull: bool) {
+    t := m.Type
+    if isNull {
+        if t == ms_type.T_INTN || t == ms_type.T_BITN || t == ms_type.T_FLTN ||
+            t == ms_type.T_MONEYN || t == ms_type.T_DATETIMN ||
+            t == ms_type.T_DECIMALN || t == ms_type.T_NUMERICN ||
+            t == ms_type.T_GUID || t == ms_type.T_DATE ||
+            t == ms_type.T_TIME || t == ms_type.T_DATETIME2 ||
+            t == ms_type.T_DATETIMEOFF {
+            ms_pkt.Byte(b, 0)
+            return
+        }
+        ms_pkt.I16(b, 65535)
+        return
+    }
+    if t == ms_type.T_INTN {
+        n := int64(0)
+        for i := 0; i < str.Len(v); i = i + 1 {
+            c := int(v[i]) - 48
+            if c >= 0 && c <= 9 {
+                n = n * 10 + int64(c)
+            }
+        }
+        ms_pkt.Byte(b, 8)
+        ms_pkt.I64(b, n)
+        return
+    }
+    if t == ms_type.T_INT4 {
+        n := int64(0)
+        for i := 0; i < str.Len(v); i = i + 1 {
+            c := int(v[i]) - 48
+            if c >= 0 && c <= 9 {
+                n = n * 10 + int64(c)
+            }
+        }
+        ms_pkt.I32(b, n)
+        return
+    }
+    if t == ms_type.T_BITN {
+        ms_pkt.Byte(b, 1)
+        if str.Equal(v, "1") {
+            ms_pkt.Byte(b, 1)
+        } else {
+            ms_pkt.Byte(b, 0)
+        }
+        return
+    }
+    if t == ms_type.T_FLTN {
+        ms_pkt.Byte(b, 8)
+        fv, _ := strconv.ParseFloat(v)
+        fp := libc.malloc(8)
+        libc.memcpy(fp, &fv, 8)
+        ms_pkt.WriteN(b, fp, 8)
+        libc.free(fp)
+        return
+    }
+    if t == ms_type.T_NVARCHAR || t == ms_type.T_NCHAR {
+        ms_pkt.I16(b, str.Len(v) * 2)
+        ms_pkt.Ucs2(b, v)
+        return
+    }
+    if t == ms_type.T_DECIMALN || t == ms_type.T_NUMERICN {
+        // Encode "123.45" scale-s into sign+magnitude bytes.
+        encodeDecimalCell(b, v, m.Scale)
+        return
+    }
+    if t == ms_type.T_DATETIME2 {
+        // "days micros" packed: v = "YYYY-MM-DD HH:MM:SS.ffffff"
+        encodeDt2Cell(b, v)
+        return
+    }
+    // default: u16 len + raw bytes (varchar/binary family)
+    ms_pkt.I16(b, str.Len(v))
+    ms_pkt.WriteN(b, v, str.Len(v))
+}
+
+// encodeDecimalCell converts decimal text into sign+LE magnitude.
+fn encodeDecimalCell(b: *ms_pkt.OutBuf, v: string, scale: int) {
+    neg := false
+    digits := ""
+    n := str.Len(v)
+    for i := 0; i < n; i = i + 1 {
+        c := v[i]
+        if c == 45 {
+            neg = true
+        } else if c >= 48 && c <= 57 {
+            digits = str.Concat(digits, str.Substr(v, i, 1))
+        }
+    }
+    // Left-pad to scale+1 digits at least.
+    for str.Len(digits) <= scale {
+        digits = str.Concat("0", digits)
+    }
+    // magnitude = digits as big int → LE bytes.
+    big := libc.malloc(64)
+    for i := 0; i < 64; i = i + 1 {
+        big[i] = 0
+    }
+    nd := str.Len(digits)
+    for i := 0; i < nd; i = i + 1 {
+        d := int(digits[i]) - 48
+        // big = big*10 + d (little-endian byte array)
+        carry := d
+        for j := 0; j < 64; j = j + 1 {
+            cur := (int(big[j]) & 255) * 10 + carry
+            big[j] = cur & 255
+            carry = cur >> 8
+        }
+    }
+    // find used bytes
+    used := 64
+    for used > 1 && big[used - 1] == 0 {
+        used = used - 1
+    }
+    ms_pkt.Byte(b, used + 1)
+    if neg {
+        ms_pkt.Byte(b, 0)
+    } else {
+        ms_pkt.Byte(b, 1)
+    }
+    ms_pkt.WriteN(b, big, used)
+    libc.free(big)
+}
+
+// encodeDt2Cell encodes "YYYY-MM-DD HH:MM:SS.ffffff" as DATETIME2.
+fn encodeDt2Cell(b: *ms_pkt.OutBuf, v: string) {
+    // parse fields — minimal positional parse
+    if str.Len(v) < 19 {
+        ms_pkt.Byte(b, 0)
+        return
+    }
+    us := parseDtToMicros(v)
+    days := us / int64(86400000000)
+    rem := us % int64(86400000000)
+    ticks := rem * 10 // µs → 100ns at scale 7
+    ms_pkt.Byte(b, 8)
+    for i := 0; i < 5; i = i + 1 {
+        ms_pkt.Byte(b, int((ticks >> (i * 8)) & int64(255)))
+    }
+    d := days + int64(719162)
+    ms_pkt.Byte(b, int(d & int64(255)))
+    ms_pkt.Byte(b, int((d >> 8) & int64(255)))
+    ms_pkt.Byte(b, int((d >> 16) & int64(255)))
+}
+
+// parseDtToMicros converts "YYYY-MM-DD[ HH:MM:SS[.ffffff]]" to µs.
+fn parseDtToMicros(s: string) -> int64 {
+    y := digN(s, 0, 4)
+    mo := digN(s, 5, 2)
+    dy := digN(s, 8, 2)
+    hh := 0
+    mi := 0
+    ss := 0
+    fr := 0
+    if str.Len(s) >= 19 {
+        hh = digN(s, 11, 2)
+        mi = digN(s, 14, 2)
+        ss = digN(s, 17, 2)
+    }
+    if str.Len(s) > 20 && s[19] == 46 {
+        fr = digN(s, 20, 6)
+    }
+    days := daysFromCivil(y, mo, dy)
+    return days * int64(86400000000) +
+        int64(hh * 3600 + mi * 60 + ss) * int64(1000000) + int64(fr)
+}
+
+// digN reads n digits at pos.
+fn digN(s: string, pos: int, n: int) -> int {
+    v := 0
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[pos + i]) - 48
+        if c >= 0 && c <= 9 {
+            v = v * 10 + c
+        }
+    }
+    return v
+}
+
+// daysFromCivil — Hinnant.
+fn daysFromCivil(y: int, m: int, d: int) -> int64 {
+    yy := int64(y)
+    if m <= 2 {
+        yy = yy - 1
+    }
+    era := yy / 400
+    if yy < 0 && yy % 400 != 0 {
+        era = era - 1
+    }
+    yoe := yy - era * 400
+    mm := m
+    if m > 2 {
+        mm = m - 3
+    } else {
+        mm = m + 9
+    }
+    doy := (153 * int64(mm) + 2) / 5 + int64(d) - 1
+    doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// patch16 writes a little-endian u16 at pos.
+fn patch16(b: *ms_pkt.OutBuf, pos: int, v: int) {
+    b.Buf[pos] = v & 255
+    b.Buf[pos + 1] = (v >> 8) & 255
+}
+
+// ---- server loop ---------------------------------------------------------------
+
+// preloginReply builds the canned PRELOGIN response: VERSION, ENCRYPT
+// NOT_SUP, MARS off.
+fn preloginReply() -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(64)
+    ms_pkt.Byte(&b, 0)      // VERSION — data starts at byte 11
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 11)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 6)
+    ms_pkt.Byte(&b, 1)      // ENCRYPT
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 17)
+    ms_pkt.Byte(&b, 0)
+    ms_pkt.Byte(&b, 1)
+    ms_pkt.Byte(&b, 255)    // terminator
+    v := libc.malloc(6)
+    v[0] = 16
+    v[1] = 0
+    v[2] = 4052 >> 8 & 255
+    v[3] = 4052 & 255
+    v[4] = 0
+    v[5] = 0
+    ms_pkt.WriteN(&b, v, 6)
+    libc.free(v)
+    ms_pkt.Byte(&b, 2) // ENCRYPT_NOT_SUP — plaintext login accepted
+    return b
+}
+
+// loginReply builds LOGINACK + ENVCHANGE + DONE for LOGIN7.
+fn loginReply() -> ms_pkt.OutBuf {
+    b := ms_pkt.NewOutBuf(64)
+    LoginAckTok(&b, 16, 0)
+    EnvChangeTok(&b)
+    DoneInto(&b, 0, int64(0))
+    return b
+}
+
+// decodeBatch extracts the UCS-2 batch text. ALL_HEADERS starts with
+// a u32 total length covering all headers — skip that many bytes.
+fn decodeBatch(body: string, n: int) -> string {
+    if n < 4 {
+        return ""
+    }
+    r := ms_pkt.NewReader(body, n)
+    hdrLen := int(ms_pkt.RI32(&r))
+    if hdrLen > n || hdrLen < 4 {
+        hdrLen = 4
+    }
+    r.Pos = hdrLen
+    return ms_pkt.RUcs2(&r, n - hdrLen)
+}
+
+// Serve accepts one connection and serves `turns` command packets
+// (after prelogin+login which are handled internally). The responder
+// gets the decoded batch text and returns a token payload to send.
+pub fn Serve(fs: *FakeServer, turns: int,
+        respond: fn(MsReq) -> ms_pkt.OutBuf, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(fs.listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", fs.Port)
+    // PRELOGIN
+    body, n, pt, rerr := ms_pkt.Recv(&bc)
+    if str.Len(rerr.message) > 0 || pt != ms_pkt.PT_PRELOGIN {
+        bc.Close()
+        fs.listener.Close()
+        waitgroup.Done(wg)
+        return
+    }
+    pl := preloginReply()
+    ms_pkt.Send(&bc, ms_pkt.PT_RESPONSE, pl.Buf, pl.Len)
+    ms_pkt.Free(&pl)
+    libc.free(body)
+    // LOGIN7
+    body, n, pt, rerr = ms_pkt.Recv(&bc)
+    if str.Len(rerr.message) > 0 || pt != ms_pkt.PT_LOGIN7 {
+        bc.Close()
+        fs.listener.Close()
+        waitgroup.Done(wg)
+        return
+    }
+    libc.free(body)
+    lr := loginReply()
+    ms_pkt.Send(&bc, ms_pkt.PT_RESPONSE, lr.Buf, lr.Len)
+    ms_pkt.Free(&lr)
+    // command loop
+    for i := 0; i < turns; i = i + 1 {
+        body, n, pt, rerr = ms_pkt.Recv(&bc)
+        if str.Len(rerr.message) > 0 {
+            break
+        }
+        req := MsReq{Ptype: pt, Sql: decodeBatch(body, n)}
+        libc.free(body)
+        script := respond(req)
+        if script.Len == 0 {
+            ms_pkt.Free(&script)
+            break
+        }
+        ms_pkt.Send(&bc, ms_pkt.PT_RESPONSE, script.Buf, script.Len)
+        ms_pkt.Free(&script)
+    }
+    bc.Close()
+    fs.listener.Close()
+    waitgroup.Done(wg)
+}
+
+// StartFakeServer listens on a loopback port and returns the server
+// plus an armed waitgroup.
+pub fn StartFakeServer(port: int) -> (FakeServer, *waitgroup.WaitGroup, errors.Error) {
+    listener, err := net.Listen("127.0.0.1", port)
+    if str.Len(err.message) > 0 {
+        return FakeServer{}, nil, err
+    }
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    return FakeServer{listener: listener, Port: port}, wg, errors.New("")
+}

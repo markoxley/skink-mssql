@@ -1,0 +1,298 @@
+// File:    ms_token.skink
+// Purpose: TDS response token stream — parses the token sequence a
+//          server sends after Login7 / SQLBatch / RPC: LOGINACK,
+//          ENVCHANGE, INFO/ERROR, COLMETADATA (+ column meta), ROW,
+//          NBCROW, DONE/DONEPROC/DONEINPROC/RETURNSTATUS.
+//
+//          Result accumulation: each result set's columns and rows are
+//          collected into a MsResult; DONE/DONEINPROC/DONEPROC close
+//          the current set (row counts for DML land in DONE's count).
+module ms_token
+
+import "std/str"
+import "std/libc"
+import "std/strconv"
+import "std/errors"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "ms_pkt"
+import "ms_type"
+
+// token type bytes
+pub const TK_RETURNSTATUS = 0x79
+pub const TK_COLMETADATA  = 0x81
+pub const TK_ORDER        = 0xA9
+pub const TK_ERROR        = 0xAA
+pub const TK_INFO         = 0xAB
+pub const TK_RETURNVALUE  = 0xAC
+pub const TK_LOGINACK     = 0xAD
+pub const TK_ROW          = 0xD1
+pub const TK_NBCROW       = 0xD2
+pub const TK_ENVCHANGE    = 0xE3
+pub const TK_DONE         = 0xFD
+pub const TK_DONEPROC     = 0xFE
+pub const TK_DONEINPROC   = 0xFF
+pub const TK_OFFSET       = 0x78
+pub const TK_SSPI         = 0xED
+pub const TK_FEATUREEXT   = 0xAE
+pub const TK_SESSIONSTATE = 0xE4
+pub const TK_TVPFMT       = 0x97 // TVP row metadata (skipped)
+
+// DONE status flags
+pub const DONE_MORE   = 0x0001
+pub const DONE_ERROR  = 0x0002
+pub const DONE_INXACT = 0x0004
+pub const DONE_COUNT  = 0x0010
+pub const DONE_SRVERROR = 0x0100
+
+// MsResult is one complete response: result sets + error info.
+pub struct MsResult {
+    Columns:   []string
+    Metas:     []ms_type.ColMeta
+    Data:      [][]dbx_value.Value
+    Affected:  int64
+    ErrText:   string
+    ErrNum:    int
+    ErrState:  int
+    ErrClass:  int
+    InTx:      bool
+    TxDesc:    int64  // TDS 7.2+ transaction descriptor (ENVCHANGE 8)
+    TxDescSeen: bool  // an ENVCHANGE 8/9/10 token was present — without
+                      // this, TxDesc==0 means "not reported", not "none"
+    ServerVer: string // filled by LOGINACK
+}
+
+// readU16Len reads the u16-token-length prefix.
+fn readLen16(r: *ms_pkt.Reader) -> int {
+    return ms_pkt.RI16(r)
+}
+
+// readMsg parses an ERROR/INFO token body → number/state/class/msg.
+fn readMsg(r: *ms_pkt.Reader, lim: int) -> (int, int, int, string) {
+    end := r.Pos + lim
+    num := int(ms_pkt.RI32(r))
+    state := ms_pkt.RByte(r)
+    class := ms_pkt.RByte(r)
+    mlen := ms_pkt.RI16(r)
+    msg := ms_pkt.RUcs2(r, mlen * 2)
+    r.Pos = end // skip server/proc/line tail
+    return num, state, class, msg
+}
+
+// parseColMeta reads one COLMETADATA body into a column list.
+fn parseColMeta(r: *ms_pkt.Reader) -> ([]ms_type.ColMeta, errors.Error) {
+    count := ms_pkt.RI16(r)
+    var cols []ms_type.ColMeta
+    if count == 65535 { // 0xFFFF = no metadata
+        return cols, errors.New("")
+    }
+    for i := 0; i < count; i = i + 1 {
+        m := ms_type.ColMeta{}
+        ms_pkt.RI32(r)              // usertype — ULONG for TDS 7.3+
+        m.Flags = ms_pkt.RI16(r)    // flags
+        m.Nullable = (m.Flags & 1) != 0
+        m.Type = ms_pkt.RByte(r)
+        perr := ms_type.ParseTypeInfo(r, &m)
+        if str.Len(perr.message) > 0 {
+            return cols, perr
+        }
+        nlen := ms_pkt.RByte(r)
+        m.Name = ms_pkt.RUcs2(r, nlen * 2)
+        cols = append(cols, m)
+    }
+    return cols, errors.New("")
+}
+
+// readRow decodes one ROW token (or NBCROW tail) using col metadata.
+// nullBmpLen is the byte count backing nullBmp — a binary bitmap can
+// start with a 0x00 byte, so strlen would wrongly report it empty.
+fn readRow(r: *ms_pkt.Reader, cols: []ms_type.ColMeta, nullBmp: string, nullBmpLen: int) -> []dbx_value.Value {
+    var row []dbx_value.Value
+    for i := 0; i < len(cols); i = i + 1 {
+        if i / 8 < nullBmpLen {
+            // NBCROW: bit i set → NULL.
+            bmp := int(nullBmp[i / 8]) & 255
+            if (bmp & (1 << (i % 8))) != 0 {
+                row = append(row, dbx_value.Null())
+                continue
+            }
+        }
+        row = append(row, ms_type.DecodeValue(r, cols[i]))
+    }
+    return row
+}
+
+// ParseTokens walks a response payload accumulating into res. Returns
+// when the stream ends or an irrecoverable token appears.
+pub fn ParseTokens(body: string, n: int, res: *MsResult) -> errors.Error {
+    r := ms_pkt.NewReader(body, n)
+    var cols []ms_type.ColMeta
+    var names []string
+    for r.Pos < n {
+        tk := ms_pkt.RByte(&r)
+        if tk == 0 {
+            break
+        }
+        if tk == TK_DONE || tk == TK_DONEPROC || tk == TK_DONEINPROC {
+            status := ms_pkt.RI16(&r)
+            ms_pkt.RI16(&r) // curcmd
+            cnt := ms_pkt.RI64(&r)
+            if (status & DONE_COUNT) != 0 {
+                res.Affected = cnt
+            }
+            if (status & DONE_ERROR) != 0 || (status & DONE_SRVERROR) != 0 {
+                if str.Len(res.ErrText) == 0 {
+                    res.ErrText = "tds: error status in DONE"
+                }
+            }
+            // DONE_INXACT can only *set* InTx — ENVCHANGE (types 8/9/10)
+            // is authoritative for clearing it; BEGIN TRAN's DONE
+            // doesn't always carry the flag.
+            if (status & DONE_INXACT) != 0 {
+                res.InTx = true
+            }
+            cols = []ms_type.ColMeta{}
+            continue
+        }
+        if tk == TK_COLMETADATA {
+            var cerr errors.Error
+            cols, cerr = parseColMeta(&r)
+            if str.Len(cerr.message) > 0 {
+                return cerr
+            }
+            names = []string{}
+            for i := 0; i < len(cols); i = i + 1 {
+                names = append(names, cols[i].Name)
+            }
+            res.Columns = names
+            res.Metas = cols
+            res.Data = [][]dbx_value.Value{}
+            continue
+        }
+        if tk == TK_ROW {
+            row := readRow(&r, cols, "", 0)
+            res.Data = append(res.Data, row)
+            continue
+        }
+        if tk == TK_NBCROW {
+            bmpLen := (len(cols) + 7) / 8
+            if ms_pkt.Remaining(&r) < bmpLen {
+                bmpLen = ms_pkt.Remaining(&r) // clamp to actual bytes
+            }
+            bmp := ms_pkt.RBytes(&r, bmpLen)
+            row := readRow(&r, cols, bmp, bmpLen)
+            res.Data = append(res.Data, row)
+            continue
+        }
+        if tk == TK_ERROR || tk == TK_INFO {
+            lim := readLen16(&r)
+            num, state, class, msg := readMsg(&r, lim)
+            if tk == TK_ERROR {
+                res.ErrNum = num
+                res.ErrState = state
+                res.ErrClass = class
+                res.ErrText = msg
+            }
+            // INFO is advisory — dropped.
+            continue
+        }
+        if tk == TK_ENVCHANGE {
+            lim := readLen16(&r)
+            endPos := r.Pos + lim
+            if r.Pos < endPos {
+                et := ms_pkt.RByte(&r)
+                if et == 8 { // ENV_BEGINTRAN: u8 len(8) + u64 txdesc
+                    vlen := ms_pkt.RByte(&r)
+                    if vlen == 8 && r.Pos + 8 <= endPos {
+                        res.TxDesc = ms_pkt.RI64(&r)
+                        res.TxDescSeen = true
+                        res.InTx = true
+                    }
+                }
+                if et == 9 || et == 10 { // COMMIT/ROLLBACK: tx over
+                    res.TxDesc = int64(0)
+                    res.TxDescSeen = true
+                    res.InTx = false
+                }
+            }
+            r.Pos = endPos
+            continue
+        }
+        if tk == TK_SESSIONSTATE {
+            lim := readLen16(&r)
+            r.Pos = r.Pos + lim
+            continue
+        }
+        if tk == TK_LOGINACK {
+            lim := readLen16(&r)
+            endPos := r.Pos + lim
+            ms_pkt.RByte(&r)   // interface
+            ms_pkt.RI32(&r)    // tds version
+            plen := ms_pkt.RByte(&r)
+            ms_pkt.RBytes(&r, plen * 2) // prog name (ucs2)
+            // version: 4 bytes BE (major.minor.buildhi.buildlo)
+            if r.Pos + 4 <= endPos {
+                mj := ms_pkt.RByte(&r)
+                mi := ms_pkt.RByte(&r)
+                res.ServerVer = str.Concat(strconv.Itoa(mj),
+                    str.Concat(".", strconv.Itoa(mi)))
+            }
+            r.Pos = endPos
+            continue
+        }
+        if tk == TK_SSPI {
+            lim := readLen16(&r)
+            r.Pos = r.Pos + lim
+            continue
+        }
+        if tk == TK_RETURNSTATUS {
+            ms_pkt.RI32(&r)
+            continue
+        }
+        if tk == TK_RETURNVALUE {
+            lim := readLen16(&r)
+            r.Pos = r.Pos + lim
+            continue
+        }
+        if tk == TK_ORDER {
+            lim := readLen16(&r)
+            r.Pos = r.Pos + lim
+            continue
+        }
+        if tk == TK_FEATUREEXT {
+            // FeatureAck: series of u8 feature + u32 len + data, ended by 0xFF.
+            for r.Pos < n {
+                f := ms_pkt.RByte(&r)
+                if f == 255 {
+                    break
+                }
+                fl := ms_pkt.RI32(&r)
+                r.Pos = r.Pos + int(fl)
+            }
+            continue
+        }
+        if tk == TK_OFFSET {
+            ms_pkt.RI16(&r)
+            ms_pkt.RI16(&r)
+            continue
+        }
+        if tk == TK_TVPFMT {
+            lim := readLen16(&r)
+            r.Pos = r.Pos + lim
+            continue
+        }
+        // Unknown token — bail out with what we have.
+        return errors.New(str.Concat("tds: unknown response token 0x",
+            hexByte(tk)))
+    }
+    return errors.New("")
+}
+
+// hexByte renders a byte as two hex chars.
+fn hexByte(b: int) -> string {
+    hex := "0123456789abcdef"
+    out := libc.malloc(3)
+    out[0] = hex[(b >> 4) & 15]
+    out[1] = hex[b & 15]
+    out[2] = 0
+    return out
+}
