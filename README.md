@@ -15,6 +15,7 @@ scales add mod/markoxley/skink-mssql
 
 ```skink
 import "mod/markoxley/skink-mssql"
+import "mod/markoxley/skink-mssql/ms_conn"
 import "mod/markoxley/skink-dbx/dbx_dsn"
 import "mod/markoxley/skink-dbx/dbx_value"
 
@@ -26,13 +27,15 @@ fn main() -> int {
         "SELECT id, name FROM users WHERE id > ?",
         []dbx_value.Value{dbx_value.Int(int64(10))})
     ...
-    mssql.Close(&c)
+    ms_conn.Close(&c)
 }
 ```
 
 Or through the generic `dbx` layer:
 
 ```skink
+import "mod/markoxley/skink-dbx"
+
 mssql.Register()
 conn, err := dbx.Open("mssql://sa:secret@localhost:1433/appdb")
 rows, _ := conn.Query("SELECT 1", []dbx_value.Value{})
