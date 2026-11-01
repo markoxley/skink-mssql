@@ -22,6 +22,13 @@ import "ms_pkt"
 import "ms_type"
 import "ms_token"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // prelogin token ids
 const PL_VERSION   = 0
 const PL_ENCRYPT   = 1
@@ -57,12 +64,12 @@ fn prelogin(c: *Conn, wantEncrypt: bool) -> errors.Error {
     // onto the wire.
     libc.memset(ver, 0, 6)
     // "15.0.2000.5": major=15, minor=0, build=2000 (BE u16), sub=5.
-    ver[0] = 15
-    ver[1] = 0
-    ver[2] = (2000 >> 8) & 255
-    ver[3] = 2000 & 255
-    ver[4] = 0
-    ver[5] = 5
+    Skink_mem_write_byte(ver, int64(0), 15)
+    Skink_mem_write_byte(ver, int64(1), 0)
+    Skink_mem_write_byte(ver, int64(2), (2000 >> 8) & 255)
+    Skink_mem_write_byte(ver, int64(3), 2000 & 255)
+    Skink_mem_write_byte(ver, int64(4), 0)
+    Skink_mem_write_byte(ver, int64(5), 5)
     // With encrypt=false we must declare ENCRYPT_NOT_SUP — advertising
     // ENCRYPT_OFF (0) means "client supports TLS" and the server will
     // then require the LOGIN7 packet itself be TLS-wrapped.
@@ -121,7 +128,7 @@ fn prelogin(c: *Conn, wantEncrypt: bool) -> errors.Error {
     }
     for i := 0; i < len(ids); i = i + 1 {
         if ids[i] == PL_ENCRYPT && offs[i] < n {
-            c.Encrypt = int(body[offs[i]]) & 255
+            c.Encrypt = int(Skink_mem_byte(body, int64(offs[i]))) & 255
         }
     }
     if wantEncrypt {
@@ -209,10 +216,10 @@ fn buildLogin7(info: dbx_dsn.ConnInfo) -> (string, int) {
     patch32(p, 0, total)
     // TDS version at 4 — little-endian DWORD, unlike the big-endian
     // fields in PRELOGIN. 7.4 = 0x74000004 → bytes 04 00 00 74.
-    p[4] = 4
-    p[5] = 0
-    p[6] = 0
-    p[7] = 0x74
+    Skink_mem_write_byte(p, int64(4), 4)
+    Skink_mem_write_byte(p, int64(5), 0)
+    Skink_mem_write_byte(p, int64(6), 0)
+    Skink_mem_write_byte(p, int64(7), 0x74)
     // packet size at 8 LE
     patch32(p, 8, ms_pkt.PACKET_SIZE)
     // client prog ver at 12 (4 bytes, LE-ish opaque) → zeros fine
@@ -222,30 +229,30 @@ fn buildLogin7(info: dbx_dsn.ConnInfo) -> (string, int) {
     // OptionFlags3 (27). Match the MS-TDS sample: fByteOrder|fChar|
     // fFloat|fUseDB|fSetLang in flags1 (0xE0); fLanguage|fODBC in
     // flags2 (0x03). No fUserInstance, no integrated security.
-    p[24] = 0xE0
-    p[25] = 0x03
-    p[26] = 0x00
-    p[27] = 0x00
+    Skink_mem_write_byte(p, int64(24), 0xE0)
+    Skink_mem_write_byte(p, int64(25), 0x03)
+    Skink_mem_write_byte(p, int64(26), 0x00)
+    Skink_mem_write_byte(p, int64(27), 0x00)
     // ClientTimeZone (28) = 0; ClientLCID (32) = 1033 (en-US, LE).
-    p[32] = 0x09
-    p[33] = 0x04
+    Skink_mem_write_byte(p, int64(32), 0x09)
+    Skink_mem_write_byte(p, int64(33), 0x04)
     // Field (offset,charlen) pairs: 9 pairs at 36..72
     // (HostName..Database), ClientID occupies 72..78, then SSPI/
     // AtchDB/ChangePw pairs at 78..90, cbSSPILong u32 at 90.
     for i := 0; i < 9; i = i + 1 {
         base := 36 + i * 4
-        p[base] = offs[i] & 255
-        p[base + 1] = (offs[i] >> 8) & 255
-        p[base + 2] = lens[i] & 255
-        p[base + 3] = (lens[i] >> 8) & 255
+        Skink_mem_write_byte(p, int64(base), offs[i] & 255)
+        Skink_mem_write_byte(p, int64(base + 1), (offs[i] >> 8) & 255)
+        Skink_mem_write_byte(p, int64(base + 2), lens[i] & 255)
+        Skink_mem_write_byte(p, int64(base + 3), (lens[i] >> 8) & 255)
     }
     for i := 0; i < 3; i = i + 1 {
         base := 78 + i * 4
         idx := i + 9 // fields[9..11] = sspi/atchdb/changepw
-        p[base] = offs[idx] & 255
-        p[base + 1] = (offs[idx] >> 8) & 255
-        p[base + 2] = lens[idx] & 255
-        p[base + 3] = (lens[idx] >> 8) & 255
+        Skink_mem_write_byte(p, int64(base), offs[idx] & 255)
+        Skink_mem_write_byte(p, int64(base + 1), (offs[idx] >> 8) & 255)
+        Skink_mem_write_byte(p, int64(base + 2), lens[idx] & 255)
+        Skink_mem_write_byte(p, int64(base + 3), (lens[idx] >> 8) & 255)
     }
     return b.Buf, total
 }
@@ -261,24 +268,24 @@ fn obfuscate(s: string) -> string {
     // Each char becomes a UCS-2 char; obfuscation applies per byte.
     out := libc.malloc(n * 2 + 2)
     for i := 0; i < n; i = i + 1 {
-        c := int(s[i]) & 255
+        c := Skink_mem_byte(s, int64(i)) & 255
         lo := ((c << 4) | (c >> 4)) ^ 0xA5
         hi := (((0 << 4) | (0 >> 4)) ^ 0xA5)
-        out[i * 2] = lo & 255
-        out[i * 2 + 1] = hi & 255
+        Skink_mem_write_byte(out, int64(i * 2), lo & 255)
+        Skink_mem_write_byte(out, int64(i * 2 + 1), hi & 255)
     }
     // Store the obfuscated bytes as a latin-1 string; buildLogin7 will
     // emit them raw via a special path — encode as chars 0-255.
-    out[n * 2] = 0
+    Skink_mem_write_byte(out, int64(n * 2), 0)
     return out
 }
 
 // patch32 writes a little-endian u32 into buffer bytes.
 fn patch32(p: string, off: int, v: int) {
-    p[off] = v & 255
-    p[off + 1] = (v >> 8) & 255
-    p[off + 2] = (v >> 16) & 255
-    p[off + 3] = (v >> 24) & 255
+    Skink_mem_write_byte(p, int64(off), v & 255)
+    Skink_mem_write_byte(p, int64(off + 1), (v >> 8) & 255)
+    Skink_mem_write_byte(p, int64(off + 2), (v >> 16) & 255)
+    Skink_mem_write_byte(p, int64(off + 3), (v >> 24) & 255)
 }
 
 // ---- connect -----------------------------------------------------------------
@@ -522,7 +529,7 @@ fn literalFor(v: dbx_value.Value) -> string {
         s := dbx_value.Bytes(v)
         out := "0x"
         for i := 0; i < v.Len; i = i + 1 {
-            c := int(s[i]) & 255
+            c := Skink_mem_byte(s, int64(i)) & 255
             out = str.Concat(out, str.Concat(str.Substr(hex, c >> 4, 1),
                 str.Substr(hex, c & 15, 1)))
         }
@@ -537,7 +544,7 @@ fn escapeApos(s: string) -> string {
     out := ""
     n := str.Len(s)
     for i := 0; i < n; i = i + 1 {
-        if s[i] == 39 {
+        if Skink_mem_byte(s, int64(i)) == 39 {
             out = str.Concat(out, "''")
         } else {
             out = str.Concat(out, str.Substr(s, i, 1))

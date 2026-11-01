@@ -15,6 +15,13 @@ import "std/str"
 import "std/testing"
 import "std/waitgroup"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // responder returns one int column "n" = 42 for any batch.
 fn dbxResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
     b := ms_pkt.NewOutBuf(64)

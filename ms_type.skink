@@ -17,6 +17,13 @@ import "std/strconv"
 import "mod/markoxley/skink-dbx/dbx_value"
 import "ms_pkt"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TDS type codes (subset — see file header).
 pub const T_NULL         = 0x1F
 pub const T_GUID         = 0x24
@@ -209,7 +216,7 @@ fn decodeFixed(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
         var f float
         bf := libc.malloc(8)
         for i := 0; i < 8; i = i + 1 {
-            bf[i] = int((bits >> (i * 8)) & int64(255))
+            Skink_mem_write_byte(bf, int64(i), int((bits >> (i * 8)) & int64(255)))
         }
         libc.memcpy(&f, bf, 8)
         libc.free(bf)
@@ -262,14 +269,14 @@ fn decodeDecimal(r: *ms_pkt.Reader, n: int, scale: int) -> dbx_value.Value {
         zero := true
         carry := 0
         for i := sz - 1; i >= 0; i = i - 1 {
-            cur := (carry << 8) | (int(buf[i]) & 255)
-            buf[i] = cur / 10
+            cur := (carry << 8) | (Skink_mem_byte(buf, int64(i)) & 255)
+            Skink_mem_write_byte(buf, int64(i), cur / 10)
             carry = cur % 10
-            if buf[i] != 0 {
+            if Skink_mem_byte(buf, int64(i)) != 0 {
                 zero = false
             }
         }
-        out[outLen] = 48 + carry
+        Skink_mem_write_byte(out, int64(outLen), 48 + carry)
         outLen = outLen + 1
         if zero {
             break
@@ -279,34 +286,34 @@ fn decodeDecimal(r: *ms_pkt.Reader, n: int, scale: int) -> dbx_value.Value {
     res := libc.malloc(outLen + scale + 4)
     j := 0
     if sign == 0 {
-        res[j] = 45 // '-'
+        Skink_mem_write_byte(res, int64(j), 45) // '-'
         j = j + 1
     }
     if outLen > scale {
         for i := 0; i < outLen - scale; i = i + 1 {
-            res[j] = out[outLen - 1 - i]
+            Skink_mem_write_byte(res, int64(j), Skink_mem_byte(out, int64(outLen - 1 - i)))
             j = j + 1
         }
-        res[j] = 46
+        Skink_mem_write_byte(res, int64(j), 46)
         j = j + 1
         for i := 0; i < scale; i = i + 1 {
-            res[j] = out[scale - 1 - i]
+            Skink_mem_write_byte(res, int64(j), Skink_mem_byte(out, int64(scale - 1 - i)))
             j = j + 1
         }
     } else {
-        res[j] = 48
-        res[j + 1] = 46
+        Skink_mem_write_byte(res, int64(j), 48)
+        Skink_mem_write_byte(res, int64(j + 1), 46)
         j = j + 2
         for i := 0; i < scale - outLen; i = i + 1 {
-            res[j] = 48
+            Skink_mem_write_byte(res, int64(j), 48)
             j = j + 1
         }
         for i := outLen - 1; i >= 0; i = i - 1 {
-            res[j] = out[i]
+            Skink_mem_write_byte(res, int64(j), Skink_mem_byte(out, int64(i)))
             j = j + 1
         }
     }
-    res[j] = 0
+    Skink_mem_write_byte(res, int64(j), 0)
     libc.free(digits)
     libc.free(buf)
     libc.free(out)
@@ -349,7 +356,7 @@ fn decodeLenPrefixed(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
         var f float
         bf := libc.malloc(8)
         for i := 0; i < 8; i = i + 1 {
-            bf[i] = int((bits >> (i * 8)) & int64(255))
+            Skink_mem_write_byte(bf, int64(i), int((bits >> (i * 8)) & int64(255)))
         }
         libc.memcpy(&f, bf, 8)
         libc.free(bf)
@@ -528,7 +535,7 @@ fn decodePLP(r: *ms_pkt.Reader, t: int) -> dbx_value.Value {
             libc.free(out)
         }
         libc.memcpy(string(int64(nb) + int64(outLen)), chunk, int(n))
-        nb[outLen + int(n)] = 0
+        Skink_mem_write_byte(nb, int64(outLen + int(n)), 0)
         out = nb
         outLen = outLen + int(n)
         libc.free(chunk)

@@ -18,6 +18,13 @@ import "std/str"
 import "std/os"
 import "std/errors"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 var failures = 0
 
 fn check(ok: bool, what: string) {

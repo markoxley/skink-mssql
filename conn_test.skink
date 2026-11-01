@@ -18,6 +18,13 @@ import "std/testing"
 import "std/waitgroup"
 import "std/errors"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 var lastReq testkit.MsReq
 
 // TestConnectBatch covers prelogin + login7 + one batch.
@@ -215,9 +222,9 @@ pub fn TestRewriteEscapedQuote() {
 pub fn TestRUcs2Clamp() {
     // UTF-16LE 'A' = 0x41 0x00, built raw (no \x escapes in Skink).
     buf := libc.malloc(3)
-    buf[0] = 65
-    buf[1] = 0
-    buf[2] = 0
+    Skink_mem_write_byte(buf, int64(0), 65)
+    Skink_mem_write_byte(buf, int64(1), 0)
+    Skink_mem_write_byte(buf, int64(2), 0)
     r := ms_pkt.NewReader(buf, 2)
     s := ms_pkt.RUcs2(&r, 4000)
     testing.AssertEqualString("A", s, "clamped UCS-2 read")

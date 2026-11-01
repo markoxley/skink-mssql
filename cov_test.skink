@@ -1,0 +1,191 @@
+// File:    cov_test.skink
+// Purpose: Coverage tests for previously-unexercised mssql API surface:
+//          packet writer/reader primitives, token decoding, type-info
+//          and value encode/decode, Send/Recv framing over a socket pair,
+//          and Dial/Ping/RollbackTx against the scripted fake server.
+module cov_test
+
+import "ms_pkt"
+import "ms_token"
+import "ms_type"
+import "ms_conn"
+import "mssql"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/errors"
+import "std/waitgroup"
+import "std/testing"
+
+// TestPktPrimitives round-trips every scalar write/read pair.
+pub fn TestPktPrimitives() {
+    b := ms_pkt.NewOutBuf(16)
+    ms_pkt.Byte(&b, 0x12)
+    ms_pkt.I16(&b, 0x3456)
+    ms_pkt.I32(&b, int64(0x789ABCDE))
+    ms_pkt.WriteN(&b, "xy", 2)
+    testing.AssertTrue(b.Len == 1 + 2 + 4 + 2, "buf len")
+    r := ms_pkt.NewReader(b.Buf, b.Len)
+    testing.AssertTrue(ms_pkt.Remaining(&r) == b.Len, "remaining")
+    testing.AssertEqualInt(0x12, ms_pkt.RByte(&r), "byte")
+    testing.AssertEqualInt(0x3456, ms_pkt.RI16(&r), "i16")
+    testing.AssertTrue(ms_pkt.RI32(&r) == int64(0x789ABCDE), "i32")
+    s := ms_pkt.RBytes(&r, 2)
+    testing.AssertEqualInt(0, ms_pkt.Remaining(&r), "drained")
+    _ = s
+    ms_pkt.Free(&b)
+    testing.AssertTrue(b.Buf == "" && b.Len == 0, "freed")
+}
+
+// TestPktRI64 verifies 8-byte little-endian reads.
+pub fn TestPktRI64() {
+    b := ms_pkt.NewOutBuf(16)
+    ms_pkt.I32(&b, int64(1))
+    ms_pkt.I32(&b, int64(2))
+    r := ms_pkt.NewReader(b.Buf, b.Len)
+    v := ms_pkt.RI64(&r)
+    testing.AssertTrue(v == ((int64(2) << 32) | int64(1)), "ri64")
+    ms_pkt.Free(&b)
+}
+
+// TestUcs2 covers the UTF-16LE encoder used for TDS strings.
+pub fn TestUcs2() {
+    b := ms_pkt.NewOutBuf(16)
+    ms_pkt.Ucs2(&b, "AB")
+    testing.AssertEqualInt(4, b.Len, "ucs2 2 chars -> 4 bytes")
+    testing.AssertEqualInt(65, Skink_mem_byte(b.Buf, 0), "A lo")
+    testing.AssertEqualInt(0, Skink_mem_byte(b.Buf, 1), "A hi")
+    ms_pkt.Free(&b)
+}
+
+// echoListener accepts one conn and echoes received packet bytes back.
+var echoBc dbx_bufconn.BufConn
+
+fn echoWorker(wg: *waitgroup.WaitGroup) {
+    ln, _ := net.Listen("127.0.0.1", 16990)
+    conn, _ := net.Accept(ln)
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16990)
+    body, ptype, n, _ := ms_pkt.Recv(&bc)
+    // reply with a response packet carrying the same payload
+    ms_pkt.Send(&bc, ms_pkt.PT_RESPONSE, body, n)
+    _ = ptype
+    bc.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestSendRecv verifies packet framing round-trips over a socket pair.
+pub fn TestSendRecv() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn echoWorker(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 16990)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16990)
+    serr := ms_pkt.Send(&bc, ms_pkt.PT_SQL_BATCH, "PING", 4)
+    testing.AssertEqualString("", serr.message, "send")
+    body, ptype, n, rerr := ms_pkt.Recv(&bc)
+    testing.AssertEqualString("", rerr.message, "recv")
+    testing.AssertEqualInt(4, n, "recv len")
+    _ = body
+    _ = ptype
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestParseTokens decodes a scripted token stream built by the testkit
+// emitters (DoneTok/InfoTok/EnvChangeTok/LoginAckTok).
+pub fn TestParseTokens() {
+    b := ms_pkt.NewOutBuf(256)
+    testkit.LoginAckTok(&b, 16, 0)
+    testkit.EnvChangeTok(&b)
+    testkit.InfoTok(&b, 50000, "info msg")
+    testkit.DoneInto(&b, ms_token.DONE_COUNT, int64(3))
+    var res ms_token.MsResult
+    err := ms_token.ParseTokens(b.Buf, b.Len, &res)
+    testing.AssertEqualString("", err.message, "tokens parse")
+    testing.AssertTrue(res.Affected == int64(3), "done count")
+    ms_pkt.Free(&b)
+
+    // DoneTok's standalone emitter produces an equivalent stream.
+    d := testkit.DoneTok(ms_token.DONE_COUNT, int64(9))
+    var res2 ms_token.MsResult
+    err2 := ms_token.ParseTokens(d.Buf, d.Len, &res2)
+    testing.AssertEqualString("", err2.message, "done parse")
+    testing.AssertTrue(res2.Affected == int64(9), "done count 2")
+    ms_pkt.Free(&d)
+}
+
+// TestTypeInfo covers ParseTypeInfo on a variable-length DECIMALN column.
+pub fn TestTypeInfo() {
+    b := ms_pkt.NewOutBuf(16)
+    ms_pkt.Byte(&b, 17)   // maxlen
+    ms_pkt.Byte(&b, 38)   // precision
+    ms_pkt.Byte(&b, 4)    // scale
+    r := ms_pkt.NewReader(b.Buf, b.Len)
+    m := ms_type.ColMeta{Type: ms_type.T_DECIMALN}
+    err := ms_type.ParseTypeInfo(&r, &m)
+    testing.AssertEqualString("", err.message, "typeinfo parse")
+    testing.AssertEqualInt(38, m.Precision, "precision")
+    testing.AssertEqualInt(4, m.Scale, "scale")
+    ms_pkt.Free(&b)
+}
+
+// TestDecodeValue decodes a fixed-width INT4 column value.
+pub fn TestDecodeValue() {
+    b := ms_pkt.NewOutBuf(16)
+    ms_pkt.I32(&b, int64(42))
+    r := ms_pkt.NewReader(b.Buf, b.Len)
+    m := ms_type.ColMeta{Type: ms_type.T_INT4, MaxLen: 4}
+    v := ms_type.DecodeValue(&r, m)
+    testing.AssertTrue(dbx_value.AsInt64(v) == int64(42), "int4 decode")
+    ms_pkt.Free(&b)
+}
+
+// TestTypeClasses verifies IsTextual/IsBinary type classification.
+pub fn TestTypeClasses() {
+    testing.AssertTrue(ms_type.IsTextual(ms_type.T_VARCHAR), "varchar textual")
+    testing.AssertTrue(ms_type.IsBinary(ms_type.T_BIGVARBINARY), "varbinary binary")
+    testing.AssertFalse(ms_type.IsBinary(ms_type.T_INT4), "int4 not binary")
+    testing.AssertFalse(ms_type.IsTextual(ms_type.T_INT4), "int4 not textual")
+}
+
+// TestEncodeParams encodes int/text values into a param buffer.
+pub fn TestEncodeParams() {
+    b := ms_pkt.NewOutBuf(64)
+    ms_type.EncodeParamType(&b, dbx_value.Int(int64(7)))
+    ms_type.EncodeParamValue(&b, dbx_value.Int(int64(7)))
+    testing.AssertTrue(b.Len > 0, "int param bytes")
+    n0 := b.Len
+    ms_type.EncodeParamType(&b, dbx_value.Text("hi"))
+    ms_type.EncodeParamValue(&b, dbx_value.Text("hi"))
+    testing.AssertTrue(b.Len > n0, "text param bytes")
+    ms_pkt.Free(&b)
+}
+
+// TestDialPingRollback covers the root Dial wrapper plus Ping and
+// RollbackTx against the scripted fake server.
+pub fn TestDialPingRollback() {
+    fs, wg, serr := testkit.StartFakeServer(16991)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 3, covResponder, wg)
+
+    c, cerr := mssql.Dial("mssql://sa:pw@127.0.0.1:16991/app")
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("dial: ", cerr.message))
+    perr := ms_conn.Ping(&c)
+    testing.AssertEqualString("", perr.message, "ping")
+    rerr := ms_conn.RollbackTx(&c)
+    testing.AssertEqualString("", rerr.message, "rollback")
+    ms_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// covResponder replies DONE to every scripted request.
+fn covResponder(req: testkit.MsReq) -> ms_pkt.OutBuf {
+    return testkit.DoneTok(0, int64(0))
+}

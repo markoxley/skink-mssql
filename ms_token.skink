@@ -17,6 +17,13 @@ import "mod/markoxley/skink-dbx/dbx_value"
 import "ms_pkt"
 import "ms_type"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // token type bytes
 pub const TK_RETURNSTATUS = 0x79
 pub const TK_COLMETADATA  = 0x81
@@ -110,7 +117,7 @@ fn readRow(r: *ms_pkt.Reader, cols: []ms_type.ColMeta, nullBmp: string, nullBmpL
     for i := 0; i < len(cols); i = i + 1 {
         if i / 8 < nullBmpLen {
             // NBCROW: bit i set → NULL.
-            bmp := int(nullBmp[i / 8]) & 255
+            bmp := Skink_mem_byte(nullBmp, int64(i / 8)) & 255
             if (bmp & (1 << (i % 8))) != 0 {
                 row = append(row, dbx_value.Null())
                 continue
@@ -291,8 +298,8 @@ pub fn ParseTokens(body: string, n: int, res: *MsResult) -> errors.Error {
 fn hexByte(b: int) -> string {
     hex := "0123456789abcdef"
     out := libc.malloc(3)
-    out[0] = hex[(b >> 4) & 15]
-    out[1] = hex[b & 15]
-    out[2] = 0
+    Skink_mem_write_byte(out, int64(0), hex[(b >> 4) & 15])
+    Skink_mem_write_byte(out, int64(1), hex[b & 15])
+    Skink_mem_write_byte(out, int64(2), 0)
     return out
 }
